@@ -286,7 +286,9 @@ _TOOL_INTENT_RULES: tuple[tuple[frozenset[str], re.Pattern[str]], ...] = (
     (
         frozenset({"kick_user"}),
         _intent_pattern(
-            r"\b(?:кикн\w*|выгон\w*.{0,30}(?:сервер|участник|пользовател\w*|бот\w*)|"
+            r"\b(?:кикн\w*|"
+            r"(?:выкин\w*|выгон\w*|исключ\w*).{0,45}(?:(?:с|из)\s+сервер\w*|"
+            r"сервер\w*|участник\w*|пользовател\w*|бот\w*|<@!?\d+>|@[a-z0-9._-]+)|"
             r"(?:убер\w*|удал\w*).{0,35}(?:бот\w*|пользовател\w*|участник\w*).{0,35}"
             r"(?:с\s+)?сервер\w*|kick\s+(?:user|member|@?\w+))\b"
         ),
@@ -547,7 +549,8 @@ _EXPLICIT_MUTATION_PREFIX = _intent_pattern(
     r"(?:можешь|сможешь)(?:\s+ли)?(?:\s+ты)?[,:\s]+|"
     r"(?:нужно|надо|следует|давай|хочу\s*,?\s*чтобы)[,:\s]+)*"
     r"(?:не\s+отвеча\w*|(?:снова|начни)\s+отвеча\w*|"
-    r"забан\w*|разбан\w*|бан\w*|кик\w*|выгон\w*|замут\w*|размут\w*|"
+    r"забан\w*|разбан\w*|бан\w*|кик\w*|выкин\w*|выгон\w*|исключ\w*|"
+    r"замут\w*|размут\w*|"
     r"выда\w*|добав\w*|назнач\w*|сним\w*|убер\w*|отбер\w*|"
     r"созда\w*|сдела\w*|удал\w*|уничтож\w*|измен\w*|поменя\w*|смен\w*|сброс\w*|"
     r"переимен\w*|настро\w*|разреш\w*|запрет\w*|включ\w*|выключ\w*|"
@@ -653,7 +656,12 @@ def _allowed_tool_names_for_message(message: discord.Message | None) -> frozense
         return allowed
     # Сторонним участникам доступны только запросы на изменение состояния. Само
     # действие здесь не разрешается: execute_pos_tool отправит его Пумбе в ЛС.
-    return allowed & _MUTATING_TOOLS
+    # Игнор-лист является личной политикой P.OS и никогда не создаёт сторонний
+    # запрос на подтверждение: менять его может только Пумба.
+    return (allowed & _MUTATING_TOOLS) - {
+        "mute_ai_for_user",
+        "unmute_ai_for_user",
+    }
 
 
 def _tool_schemas_for_message(message: discord.Message | None) -> list[dict]:
@@ -1154,17 +1162,30 @@ def _message_target_user_id(
     excluded_ids = {
         value
         for value in (
-            bot_id,
             getattr(getattr(message, "guild", None), "id", None),
             getattr(getattr(message, "channel", None), "id", None),
         )
         if isinstance(value, int)
     }
+    content = message.content or ""
+    leading_bot_mention = bool(
+        bot_id
+        and re.match(rf"^\s*<@!?{bot_id}>(?=\s|[,.:;!—-]|$)", content)
+        and len(re.findall(rf"<@!?{bot_id}>", content)) == 1
+    )
+
+    def is_target_candidate(candidate_id: int) -> bool:
+        if candidate_id in excluded_ids:
+            return False
+        # Ведущий mention P.OS — адресат команды. Mention P.OS после глагола
+        # остаётся целью и дойдёт до явной code-level защиты в preflight.
+        return not (candidate_id == bot_id and leading_bot_mention)
+
     candidates: list[int] = []
 
     for mentioned in list(getattr(message, "mentions", None) or []):
         mentioned_id = getattr(mentioned, "id", None)
-        if isinstance(mentioned_id, int) and mentioned_id not in excluded_ids:
+        if isinstance(mentioned_id, int) and is_target_candidate(mentioned_id):
             candidates.append(mentioned_id)
 
     if not candidates:
@@ -1173,13 +1194,13 @@ def _message_target_user_id(
                 mentioned_id = int(raw_id)
             except (TypeError, ValueError, OverflowError):
                 continue
-            if mentioned_id not in excluded_ids:
+            if is_target_candidate(mentioned_id):
                 candidates.append(mentioned_id)
 
     if not candidates:
         for raw_id in re.findall(r"(?<!\d)(\d{15,22})(?!\d)", message.content or ""):
             mentioned_id = int(raw_id)
-            if mentioned_id not in excluded_ids:
+            if is_target_candidate(mentioned_id):
                 candidates.append(mentioned_id)
 
     unique = list(dict.fromkeys(candidates))
@@ -3496,6 +3517,14 @@ async def execute_pos_tool(
     if name in _OWNER_INFO_TOOLS and not is_owner:
         return "Отказано: фактические данные сервера доступны только Пумбе."
 
+    # Игнор P.OS не является пользовательской командой и не создаёт запросов в
+    # ЛС владельца. Даже вручную сконструированный tool call здесь fail-closed.
+    if name in {"mute_ai_for_user", "unmute_ai_for_user"} and not is_owner:
+        return (
+            "Игнор-лист P.OS меняет только Пумба. Если не хочешь ответа, "
+            "просто не обращайся ко мне."
+        )
+
     if name in _MUTATING_TOOLS:
         args, user_id, target_guild, resolved_labels, preflight_error = await _prepare_mutating_tool_action(
             bot,
@@ -3675,8 +3704,6 @@ GIF_ANALYSIS_PATTERN = re.compile(
     r")",
     re.IGNORECASE,
 )
-MUTE_PATTERN = re.compile(r"(не\s*отвечай|не\s*пиши|игнорируй\s*меня|молчи\s*со\s*мной)", re.IGNORECASE)
-UNMUTE_PATTERN = re.compile(r"(можешь\s*отвечать|снова\s*отвечай|вернись\s*в\s*диалог|разрешаю\s*отвечать)", re.IGNORECASE)
 HELP_PATTERN = re.compile(r"\b(help|хелп|помощь|команды|список\s+команд)\b", re.IGNORECASE)
 # Только критичные действия (бан/разбан) обрабатываются детерминированно ради надёжности.
 # Роли, инвайты, каналы и прочее управление сервером выполняются через tool-вызовы ИИ.
@@ -4207,6 +4234,27 @@ _PLAIN_LOGIN_MENTION = re.compile(
     r"(?<![\w@<])@([a-z0-9._]{2,32})(?![\w.])",
     re.IGNORECASE,
 )
+_CONTEXT_USER_MENTION_WITH_ID = re.compile(
+    r"(?<![\w@<])@(?P<label>[^@()<>\n]{1,64}?)"
+    r"\(\s*(?:ID|айди)\s*[:#]?\s*`?(?P<id>\d{15,22})`?\s*\)",
+    re.IGNORECASE,
+)
+_PAREN_USER_MENTION_WITH_ID = re.compile(
+    r"(?<![\w@<])@\(\s*(?P<label>[^@()<>\n]{1,64})\s*\)"
+    r"\s*(?:[,;:—-]\s*)?(?:\(\s*)?"
+    r"(?:(?:ID|айди)\s*[:#]?\s*)?`?(?P<id>\d{15,22})`?\s*\)?",
+    re.IGNORECASE,
+)
+_LOGIN_USER_MENTION_WITH_ID = re.compile(
+    r"(?<![\w@<])@(?P<label>[a-z0-9._-]{2,32})"
+    r"(?:\s*(?:[,;:—-]\s*)?(?:ID|айди)\s*[:#]?\s*|\s+)"
+    r"`?(?P<id>\d{15,22})`?(?:\s*\))?",
+    re.IGNORECASE,
+)
+_PAREN_NAMED_MENTION = re.compile(
+    r"(?<![\w@<])@\(\s*(?P<label>[^@()<>\n]{1,64})\s*\)",
+    re.IGNORECASE,
+)
 
 
 def _normalize_reply_user_mentions(
@@ -4215,17 +4263,68 @@ def _normalize_reply_user_mentions(
     *,
     max_mentions: int = 5,
 ) -> str:
-    """Turn exact @login text into real mentions without enabling mass pings."""
+    """Turn verified model-written user references into safe real mentions."""
     if not text or guild is None or "@" not in text:
         return text
 
     by_login: dict[str, list[discord.Member]] = defaultdict(list)
+    by_alias: dict[str, list[discord.Member]] = defaultdict(list)
+    by_id: dict[int, discord.Member] = {}
     for member in list(getattr(guild, "members", None) or []):
+        member_id = getattr(member, "id", None)
+        if isinstance(member_id, int):
+            by_id[member_id] = member
         login = _normalize_user_lookup(getattr(member, "name", ""))
         if login:
             by_login[login].append(member)
+        aliases = {
+            login,
+            _normalize_user_lookup(getattr(member, "display_name", "")),
+            _normalize_user_lookup(getattr(member, "global_name", "")),
+        }
+        for alias in aliases - {""}:
+            by_alias[alias].append(member)
 
     replacements = 0
+
+    def replace_with_id(match: re.Match[str]) -> str:
+        nonlocal replacements
+        if replacements >= max_mentions:
+            return match.group(0)
+        member = by_id.get(int(match.group("id")))
+        label = _normalize_user_lookup(match.group("label"))
+        if member is None or label in {"everyone", "here"}:
+            return match.group(0)
+        aliases = {
+            _normalize_user_lookup(getattr(member, "name", "")),
+            _normalize_user_lookup(getattr(member, "display_name", "")),
+            _normalize_user_lookup(getattr(member, "global_name", "")),
+        } - {""}
+        if label not in aliases:
+            return match.group(0)
+        replacements += 1
+        return f"<@{member.id}>"
+
+    normalized = text
+    for pattern in (
+        _CONTEXT_USER_MENTION_WITH_ID,
+        _PAREN_USER_MENTION_WITH_ID,
+        _LOGIN_USER_MENTION_WITH_ID,
+    ):
+        normalized = pattern.sub(replace_with_id, normalized)
+
+    def replace_parenthesized(match: re.Match[str]) -> str:
+        nonlocal replacements
+        label = _normalize_user_lookup(match.group("label"))
+        if label in {"everyone", "here"} or replacements >= max_mentions:
+            return match.group(0)
+        members = list({member.id: member for member in by_alias.get(label, [])}.values())
+        if len(members) != 1:
+            return match.group(0)
+        replacements += 1
+        return f"<@{members[0].id}>"
+
+    normalized = _PAREN_NAMED_MENTION.sub(replace_parenthesized, normalized)
 
     def replace(match: re.Match[str]) -> str:
         nonlocal replacements
@@ -4238,7 +4337,7 @@ def _normalize_reply_user_mentions(
         replacements += 1
         return f"<@{members[0].id}>"
 
-    return _PLAIN_LOGIN_MENTION.sub(replace, text)
+    return _PLAIN_LOGIN_MENTION.sub(replace, normalized)
 
 
 def _allowed_user_mentions_for_text(
@@ -4928,14 +5027,6 @@ def _is_owner_user(message: discord.Message) -> bool:
     return message.author.id == POS_CREATOR_ID
 
 
-def _is_mute_request(text: str) -> bool:
-    return bool(MUTE_PATTERN.search(text or ""))
-
-
-def _is_unmute_request(text: str) -> bool:
-    return bool(UNMUTE_PATTERN.search(text or ""))
-
-
 # #15: функция-заглушка убрана — проверка прав реализована явно в execute_pos_tool
 
 
@@ -5046,6 +5137,10 @@ _TEXTUAL_TOOL_CALL_LINE = re.compile(
     r"(?im)^[ \t]*(?:[-*][ \t]+)?(?:tool[_\s-]?call|function[_\s-]?call)[ \t]*:[ \t]*"
     r"(?P<expression>[^\r\n]{1,4000})$",
 )
+_ASSIGNED_TOOL_CALL_LINE = re.compile(
+    r"(?im)^[ \t]*[a-z_][a-z0-9_]{0,63}[ \t]*=[ \t]*"
+    r"(?P<expression>[a-z_][a-z0-9_]*[ \t]*\([^\r\n]{0,4000}\))[ \t]*[.;]?$",
+)
 _TEXTUAL_TOOL_BLOCK = re.compile(
     r"(?is)<[ \t]*(?:tool[_\s-]?call|function[_\s-]?call)\b[^>]*>"
     r"(?P<body>.*?)"
@@ -5077,10 +5172,10 @@ def _contains_internal_tool_syntax(text: str, request_text: str = "") -> bool:
         return False
     if _TEXTUAL_TOOL_CALL_MARKER.search(text) or _INTERNAL_ADMIN_COMMAND.search(text):
         return True
-    return bool(
-        _allowed_tool_names_for_text(request_text)
-        and _INTERNAL_TOOL_FUNCTION.search(text)
-    )
+    # Служебные функции не должны попадать в обычный Discord-ответ даже если
+    # модель не распознала намерение пользователя и попыталась показать их как
+    # Python-переменную или псевдокоманду.
+    return bool(_INTERNAL_TOOL_FUNCTION.search(text))
 
 
 def _response_content_text(content: Any) -> str:
@@ -5293,8 +5388,18 @@ def _extract_textual_tool_calls(
                 calls.append(call)
                 break
 
-    for match in _TEXTUAL_TOOL_CALL_LINE.finditer(text):
-        raw_expression = match.group("expression").strip().strip("`").strip()
+    raw_expressions = [
+        match.group("expression")
+        for match in _TEXTUAL_TOOL_CALL_LINE.finditer(text)
+    ]
+    if allow_bare:
+        raw_expressions.extend(
+            match.group("expression")
+            for match in _ASSIGNED_TOOL_CALL_LINE.finditer(text)
+        )
+
+    for raw_value in raw_expressions:
+        raw_expression = raw_value.strip().strip("`").strip()
         expression: ast.AST | None = None
         for candidate in (raw_expression, raw_expression.rstrip(".;")):
             try:
@@ -6371,25 +6476,6 @@ async def handle_pos_ai(message: discord.Message, bot: discord.Client) -> bool:
     prompt_security_reasons = _detect_prompt_injection(message.content or "")
     if prompt_security_reasons:
         await _record_prompt_security_event(message, prompt_security_reasons)
-
-    text = message.content or ""
-    if _is_mute_request(text):
-        # #9: пишем мут в БД (единый источник истины), чтобы он переживал рестарт
-        # и совпадал с tool-инструментом mute_ai_for_user.
-        await set_ai_muted_user(message.author.id, guild.id, True)
-        await _send_plain_response(
-            message,
-            "Ответы P.OS для этого аккаунта на сервере отключены.",
-        )
-        return True
-
-    if _is_unmute_request(text):
-        await set_ai_muted_user(message.author.id, guild.id, False)
-        await _send_plain_response(
-            message,
-            "Ответы P.OS для этого аккаунта на сервере включены.",
-        )
-        return True
 
     if await is_ai_muted(message.author.id, guild.id):
         return False

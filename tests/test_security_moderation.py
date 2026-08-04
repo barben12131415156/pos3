@@ -300,6 +300,7 @@ class AiModerationSafetyTests(unittest.IsolatedAsyncioTestCase):
         )
         media_context = SimpleNamespace(
             visual_inputs=[],
+            analyses=[{"analysis": "реклама казино"}],
             as_untrusted_text=lambda: (
                 "[UNTRUSTED_MEDIA_ANALYSIS]\n"
                 '{"analysis":"реклама казино"}\n'
@@ -309,8 +310,8 @@ class AiModerationSafetyTests(unittest.IsolatedAsyncioTestCase):
         completion = AsyncMock(
             return_value={
                 "content": (
-                    '{"results":[{"item":"media-1","label":"block",'
-                    '"basis":"visual","reason":"casino ad","confidence":0.99}]}'
+                    '{"label":"block","basis":"audio",'
+                    '"reason":"casino ad","confidence":0.99}'
                 )
             }
         )
@@ -334,7 +335,7 @@ class AiModerationSafetyTests(unittest.IsolatedAsyncioTestCase):
         ):
             verdicts = await moderation._classify_media_with_ai([attachment])
 
-        self.assertEqual(verdicts[id(attachment)][0], "block")
+        self.assertEqual(verdicts[id(attachment)][0], "allow")
         prompt = completion.await_args.args[0][1]["content"]
         self.assertTrue(
             any(
@@ -343,6 +344,54 @@ class AiModerationSafetyTests(unittest.IsolatedAsyncioTestCase):
                 for item in prompt
             )
         )
+
+    async def test_animated_gif_review_uses_all_sampled_frames(self):
+        attachment = SimpleNamespace(
+            filename="sequence.gif",
+            content_type="image/gif",
+            size=1024,
+        )
+        frame_urls = [f"data:image/png;base64,frame-{index}" for index in range(8)]
+        media_context = SimpleNamespace(
+            visual_inputs=frame_urls,
+            analyses=[],
+            as_untrusted_text=lambda: "",
+        )
+        completion = AsyncMock(
+            return_value={
+                "content": (
+                    '{"label":"allow","basis":"visual",'
+                    '"reason":"neutral animation","confidence":0.99}'
+                )
+            }
+        )
+
+        with patch.object(
+            moderation,
+            "ai_has_configured_provider",
+            return_value=True,
+        ), patch.object(
+            moderation,
+            "ai_is_temporarily_unavailable",
+            return_value=False,
+        ), patch.object(
+            moderation,
+            "extract_media_context",
+            new=AsyncMock(return_value=media_context),
+        ), patch.object(
+            moderation,
+            "pos_chat_completion",
+            new=completion,
+        ):
+            verdicts = await moderation._classify_media_with_ai([attachment])
+
+        self.assertEqual(verdicts[id(attachment)][0], "allow")
+        prompt = completion.await_args.args[0][1]["content"]
+        visual_items = [
+            item for item in prompt
+            if isinstance(item, dict) and item.get("type") == "image_url"
+        ]
+        self.assertEqual(len(visual_items), len(frame_urls))
 
     async def test_vt_safe_cache_does_not_suppress_google_check(self):
         url = "https://example.com/hello"

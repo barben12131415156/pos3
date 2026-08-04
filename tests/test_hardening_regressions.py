@@ -16,8 +16,10 @@ from moderation import extract_urls
 from pos_ai import (
     _allowed_user_mentions_for_text,
     _extract_textual_tool_calls,
+    _message_target_user_id,
     _normalize_reply_user_mentions,
     _send_plain_response,
+    execute_pos_tool,
     request_pos_reply,
 )
 from storage import close_all_connections, restore_db_from_discord
@@ -79,6 +81,7 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
                 '{"user_id":"1351879409832951893"}}}'
             ),
             "kick_user(user_id='1351879409832951893')",
+            "action = kick_user(user_id='1351879409832951893')",
         ]
 
         for sample in samples:
@@ -155,6 +158,32 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         schemas = chat.await_args.kwargs["tools"]
         self.assertEqual([schema["function"]["name"] for schema in schemas], ["ban_user"])
         self.assertEqual(chat.await_args.kwargs["tool_choice"], "required")
+
+    async def test_non_owner_cannot_create_ignore_request_or_owner_dm(self):
+        target_id = 1351879409832951893
+        message = SimpleNamespace(
+            content=f"P.OS, не отвечай пользователю <@{target_id}>",
+            author=SimpleNamespace(id=111111111111111111),
+            guild=SimpleNamespace(id=1352394387362939003),
+        )
+        tool_call = {
+            "function": {
+                "name": "mute_ai_for_user",
+                "arguments": json.dumps({"user_id": str(target_id)}),
+            }
+        }
+        creator_lookup = AsyncMock()
+
+        with patch("pos_ai._get_creator_user", new=creator_lookup):
+            result = await execute_pos_tool(
+                SimpleNamespace(),
+                message,
+                tool_call,
+                allowed_tool_names=frozenset({"mute_ai_for_user"}),
+            )
+
+        self.assertIn("только Пумба", result)
+        creator_lookup.assert_not_awaited()
 
     async def test_unstructured_action_response_is_retried_then_rejected_truthfully(self):
         message = SimpleNamespace(
@@ -314,6 +343,29 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
             "1351879409832951893",
         )
 
+    async def test_reported_kick_phrase_executes_assigned_provider_call(self):
+        target_id = 1351879409832951893
+        response = {
+            "role": "assistant",
+            "content": f"action = kick_user(user_id='{target_id}')",
+        }
+        message = SimpleNamespace(
+            content=f"P.OS, выкинь с сервера <@{target_id}>",
+            author=SimpleNamespace(id=968698192411652176),
+        )
+        execute = AsyncMock(return_value=f"Пользователь {target_id} кикнут с сервера.")
+
+        with patch("pos_ai.pos_chat_completion", new=AsyncMock(return_value=response)), patch(
+            "pos_ai.execute_pos_tool",
+            new=execute,
+        ):
+            result = await request_pos_reply(SimpleNamespace(), message, [])
+
+        self.assertIn("кикнут с сервера", result)
+        execute.assert_awaited_once()
+        call = execute.await_args.args[2]
+        self.assertEqual(call["function"]["name"], "kick_user")
+
 
 class PlainReplyTests(unittest.IsolatedAsyncioTestCase):
     async def test_plain_login_becomes_one_safe_real_user_mention(self):
@@ -328,6 +380,44 @@ class PlainReplyTests(unittest.IsolatedAsyncioTestCase):
 
         allowed = _allowed_user_mentions_for_text(normalized, guild)
         self.assertEqual(allowed.to_dict(), {"users": [member.id], "parse": []})
+
+    async def test_model_decorated_mentions_become_one_real_ping_without_raw_id(self):
+        member = SimpleNamespace(
+            id=1351879409832951893,
+            name="juniperbot",
+            display_name="Juniper Bot",
+            global_name="Juniper Bot",
+        )
+        guild = SimpleNamespace(
+            members=[member],
+            get_member=lambda user_id: member if user_id == member.id else None,
+        )
+        samples = (
+            f"Позови @Juniper Bot(ID:{member.id}).",
+            f"Позови @(Juniper Bot) ID: {member.id}.",
+            f"Позови @juniperbot {member.id}.",
+            "Позови @(Juniper Bot).",
+        )
+
+        for sample in samples:
+            with self.subTest(sample=sample):
+                normalized = _normalize_reply_user_mentions(sample, guild)
+                self.assertEqual(normalized.count(f"<@{member.id}>"), 1)
+                self.assertNotIn(str(member.id), normalized.replace(f"<@{member.id}>", ""))
+
+    async def test_mismatched_decorated_name_does_not_ping_id(self):
+        member = SimpleNamespace(
+            id=1351879409832951893,
+            name="juniperbot",
+            display_name="Juniper Bot",
+            global_name="Juniper Bot",
+        )
+        guild = SimpleNamespace(
+            members=[member],
+            get_member=lambda user_id: member if user_id == member.id else None,
+        )
+        raw = f"@(Другой человек) ID: {member.id}"
+        self.assertEqual(_normalize_reply_user_mentions(raw, guild), raw)
 
     async def test_normal_response_sends_text_without_embed(self):
         member = SimpleNamespace(id=1351879409832951893, name="juniperbot")
@@ -350,6 +440,34 @@ class PlainReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("embed", kwargs)
         self.assertEqual(kwargs["allowed_mentions"].to_dict(), {"users": [member.id], "parse": []})
 
+
+class CurrentMessageTargetTests(unittest.TestCase):
+    def test_bot_mention_after_action_is_a_protected_target_not_silently_dropped(self):
+        bot_id = 1393592093137440838
+        bot = SimpleNamespace(user=SimpleNamespace(id=bot_id))
+        target = SimpleNamespace(id=bot_id)
+        message = SimpleNamespace(
+            content=f"P.OS, выкинь с сервера <@{bot_id}>",
+            guild=SimpleNamespace(id=1352394387362939003),
+            channel=SimpleNamespace(id=1352394388449267897),
+            mentions=[target],
+            raw_mentions=[bot_id],
+            reference=None,
+        )
+        self.assertEqual(_message_target_user_id(message, bot), bot_id)
+
+    def test_leading_bot_mention_is_only_the_addressee(self):
+        bot_id = 1393592093137440838
+        bot = SimpleNamespace(user=SimpleNamespace(id=bot_id))
+        message = SimpleNamespace(
+            content=f"<@{bot_id}> покажи роли",
+            guild=SimpleNamespace(id=1352394387362939003),
+            channel=SimpleNamespace(id=1352394388449267897),
+            mentions=[SimpleNamespace(id=bot_id)],
+            raw_mentions=[bot_id],
+            reference=None,
+        )
+        self.assertIsNone(_message_target_user_id(message, bot))
 
 class RestoreFallbackTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
