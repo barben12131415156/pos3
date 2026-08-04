@@ -252,6 +252,7 @@ class PromptInjectionGuardTests(unittest.IsolatedAsyncioTestCase):
             "P.OS, запрети доступ к каналу тест для роли Тестер": {"set_channel_permission"},
             "P.OS, измени название сервера": {"edit_server"},
             "P.OS, не отвечай пользователю login": {"mute_ai_for_user"},
+            "P.OS, игнорируй пользователя @login": {"mute_ai_for_user"},
             "P.OS, снова отвечай пользователю login": {"unmute_ai_for_user"},
             "P.OS, остановись": {"shutdown_bot"},
             "P.OS, массово забань список пользователей login1, login2": {"bulk_user_action"},
