@@ -266,14 +266,20 @@ async def is_ai_muted(user_id: int, guild_id: int, db_path: str = DEFAULT_DB_PAT
 
 
 async def set_ai_muted_user(user_id: int, guild_id: int, muted: bool, db_path: str = DEFAULT_DB_PATH) -> None:
-    """Upsert the muted status of a user for P.OS on a guild."""
+    """Add a user to P.OS ignore or physically remove the ignore record."""
     async with _loop_lock(_write_locks):
         conn = await _get_conn(db_path)
-        await conn.execute(
-            "INSERT INTO ai_muted (user_id, guild_id, muted) VALUES (?, ?, ?) "
-            "ON CONFLICT(user_id, guild_id) DO UPDATE SET muted = excluded.muted",
-            (user_id, guild_id, int(muted)),
-        )
+        if muted:
+            await conn.execute(
+                "INSERT INTO ai_muted (user_id, guild_id, muted) VALUES (?, ?, 1) "
+                "ON CONFLICT(user_id, guild_id) DO UPDATE SET muted = 1",
+                (user_id, guild_id),
+            )
+        else:
+            await conn.execute(
+                "DELETE FROM ai_muted WHERE user_id = ? AND guild_id = ?",
+                (user_id, guild_id),
+            )
         await conn.commit()
 
 

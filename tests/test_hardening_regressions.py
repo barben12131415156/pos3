@@ -308,10 +308,8 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
              patch("pos_ai.execute_pos_tool", new=execute):
             result = await request_pos_reply(SimpleNamespace(), message, [])
 
-        self.assertEqual(result, "Отказано: получена неизвестная управляющая операция.")
-        normalized_call = execute.await_args.args[2]
-        self.assertEqual(normalized_call["function"]["name"], "")
-        self.assertEqual(normalized_call["function"]["arguments"], "{}")
+        self.assertIn("управляющий контур", result)
+        execute.assert_not_awaited()
 
     async def test_textual_tool_call_from_provider_is_executed(self):
         response = {
