@@ -14,7 +14,7 @@ from storage import (
     is_ai_muted,
     set_ai_muted_user,
 )
-from tool_router import ToolIntentPlan, plan_pos_tools
+from tool_router import ToolIntentPlan, _router_messages, plan_pos_tools
 
 
 def _message(content: str, *, actor_id: int = 968698192411652176, message_id: int = 77):
@@ -69,6 +69,22 @@ class _HistoryChannel:
 
 
 class SemanticToolRouterTests(unittest.IsolatedAsyncioTestCase):
+    def test_router_prompt_distinguishes_role_creation_from_assignment(self):
+        messages = _router_messages(
+            "P.OS, мне нужна роль TEST на сервере",
+            "",
+            [
+                {"name": "add_role", "impact": "write", "description": "assign"},
+                {"name": "create_role", "impact": "write", "description": "create"},
+            ],
+        )
+
+        prompt = messages[0]["content"]
+        self.assertIn("create_role создаёт новую", prompt)
+        self.assertIn("add_role только назначает", prompt)
+        self.assertIn("без получателя означают create_role", prompt)
+        self.assertIn("не добавляй list/read-инструменты", prompt)
+
     async def test_semantic_paraphrase_routes_kick_without_keyword_matching(self):
         message = _message("P.OS, этому роботу здесь больше не место, проводи его за дверь")
         response = {

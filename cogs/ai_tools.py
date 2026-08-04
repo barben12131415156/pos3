@@ -70,7 +70,7 @@ POS_AI_TOOLS = [
         "type": "function",
         "function": {
             "name": "add_role",
-            "description": "Выдает роль пользователю.",
+            "description": "Назначает уже существующую роль конкретному пользователю. Не создаёт новую роль сервера; для создания используй create_role.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -91,7 +91,7 @@ POS_AI_TOOLS = [
         "type": "function",
         "function": {
             "name": "remove_role",
-            "description": "Снимает роль с пользователя.",
+            "description": "Снимает уже существующую роль с конкретного пользователя. Не удаляет саму роль сервера; для удаления используй delete_role.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -112,7 +112,7 @@ POS_AI_TOOLS = [
         "type": "function",
         "function": {
             "name": "create_role",
-            "description": "Создаёт новую роль на сервере.",
+            "description": "Создаёт новый объект роли на сервере. Не назначает роль пользователю; для назначения существующей роли используй add_role.",
             "parameters": {
                 "type": "object",
                 "properties": {
