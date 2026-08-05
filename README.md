@@ -107,6 +107,24 @@ that entry first and can send bounded audio/video to Gemini's native
 `generateContent` API; image/GIF/video-frame understanding still works when the
 native media analysis is unavailable.
 
+### Private Telegram relay (optional)
+
+The relay uses a dedicated Telegram bot, not a personal Telegram account. It is
+disabled unless all three identity variables are configured:
+
+| Variable | Description |
+| --- | --- |
+| `TELEGRAM_BOT_TOKEN` | Token for the dedicated relay bot |
+| `TELEGRAM_OWNER_USER_ID` | Exact Telegram user ID allowed to answer requests |
+| `TELEGRAM_OWNER_CHAT_ID` | Exact private chat where requests are delivered |
+
+`TELEGRAM_CONTACT_MIN_INTERVAL_SECONDS`, `TELEGRAM_CONTACT_DAILY_LIMIT`,
+`TELEGRAM_CONTACT_GLOBAL_HOURLY_LIMIT`, and
+`TELEGRAM_CONTACT_MAX_PENDING_PER_USER` control abuse protection. Telegram
+messages never expose the owner's username or chat ID to Discord users. Owner
+replies are delivered by DM by default; `/public` explicitly posts a reply in
+the source channel and `/dm` explicitly keeps it private.
+
 ### Other useful settings
 
 - `POS_AI_SYSTEM_PROMPT` — optional owner context appended to the immutable P.OS identity and safety core

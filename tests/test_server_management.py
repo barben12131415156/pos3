@@ -12,7 +12,7 @@ with patch("storage.add_entry"), \
     from pos_ai import (
         _parse_bool, _summarize_tool_call,
         _MUTATING_TOOLS, _OWNER_CONFIRMATION_TOOLS,
-        _OWNER_ONLY_TOOLS, _OWNER_INFO_TOOLS, _READ_ONLY_TOOLS,
+        _OWNER_ONLY_TOOLS, _OWNER_INFO_TOOLS, _PUBLIC_ACTION_TOOLS, _READ_ONLY_TOOLS,
         _TOOL_ACTION_LABELS,
         _perform_shutdown, _prepare_mutating_tool_action, _resolve_member_smart,
         _resolve_category_smart, _resolve_guild, _split_user_identifiers,
@@ -38,7 +38,8 @@ class ToolSchemaTests(unittest.TestCase):
             "manage_scheduled_event", "create_forum_post", "set_server_safety",
             "list_emojis", "manage_emoji", "list_stickers", "manage_sticker",
             "remember_fact", "list_memory_entries", "delete_memory_entry",
-            "refresh_server_memory",
+            "refresh_server_memory", "undo_recent_actions",
+            "contact_pumba_telegram",
         ]:
             self.assertIn(expected, names, f"tool {expected} отсутствует в схеме")
 
@@ -52,9 +53,10 @@ class ToolSchemaTests(unittest.TestCase):
                      "bulk_user_action", "research_web", "read_web_page", "runtime_status"]:
             self.assertIn(name, _OWNER_ONLY_TOOLS)
 
-    def test_every_ai_tool_is_owner_only_in_current_beta(self):
+    def test_every_ai_tool_is_explicitly_scoped(self):
         names = {tool["function"]["name"] for tool in POS_AI_TOOLS}
-        self.assertEqual(names, _OWNER_ONLY_TOOLS)
+        self.assertEqual(names, _OWNER_ONLY_TOOLS | _PUBLIC_ACTION_TOOLS)
+        self.assertEqual(_PUBLIC_ACTION_TOOLS, frozenset({"contact_pumba_telegram"}))
 
     def test_every_owner_tool_has_label(self):
         for name in _OWNER_ONLY_TOOLS:

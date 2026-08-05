@@ -18,11 +18,17 @@ from pos_ai import (
     _extract_textual_tool_calls,
     _message_target_user_id,
     _normalize_reply_user_mentions,
+    _prepare_mutating_tool_action,
     _send_plain_response,
     execute_pos_tool,
     request_pos_reply,
 )
 from storage import close_all_connections, restore_db_from_discord
+from tool_router import ToolIntentPlan
+
+
+def _semantic_plan(message, *tool_names: str) -> ToolIntentPlan:
+    return ToolIntentPlan.for_tools(message, set(tool_names))
 
 
 class MessageGateTests(unittest.IsolatedAsyncioTestCase):
@@ -125,7 +131,13 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         execute = AsyncMock(return_value="Пользователь забанен.")
         with patch("pos_ai.pos_chat_completion", new=chat), \
              patch("pos_ai.execute_pos_tool", new=execute):
-            result = await request_pos_reply(SimpleNamespace(), message, [], state=state)
+            result = await request_pos_reply(
+                SimpleNamespace(),
+                message,
+                [],
+                state=state,
+                tool_plan=_semantic_plan(message, "ban_user"),
+            )
 
         schemas = chat.await_args.kwargs["tools"]
         self.assertEqual([schema["function"]["name"] for schema in schemas], ["ban_user"])
@@ -152,7 +164,12 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("pos_ai.pos_chat_completion", new=chat), \
              patch("pos_ai.execute_pos_tool", new=execute):
-            result = await request_pos_reply(SimpleNamespace(), message, [])
+            result = await request_pos_reply(
+                SimpleNamespace(),
+                message,
+                [],
+                tool_plan=_semantic_plan(message, "ban_user"),
+            )
 
         self.assertEqual(result, "Запрос отправлен Пумбе на подтверждение.")
         schemas = chat.await_args.kwargs["tools"]
@@ -200,7 +217,12 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("pos_ai.pos_chat_completion", new=chat), \
              patch("pos_ai.execute_pos_tool", new=execute):
-            result = await request_pos_reply(SimpleNamespace(), message, [])
+            result = await request_pos_reply(
+                SimpleNamespace(),
+                message,
+                [],
+                tool_plan=_semantic_plan(message, "kick_user"),
+            )
 
         self.assertIn("Никакая команда не запускалась", result)
         self.assertNotIn("p.kick", result)
@@ -239,7 +261,13 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
             "pos_ai.execute_pos_tool",
             new=execute,
         ):
-            result = await request_pos_reply(SimpleNamespace(user=SimpleNamespace(id=999)), message, [], state=state)
+            result = await request_pos_reply(
+                SimpleNamespace(user=SimpleNamespace(id=999)),
+                message,
+                [],
+                state=state,
+                tool_plan=_semantic_plan(message, "ban_user"),
+            )
 
         self.assertIn("успешно забанен", result)
         self.assertTrue(state["tools_executed"])
@@ -263,7 +291,12 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("pos_ai.pos_chat_completion", new=chat), \
              patch("pos_ai.execute_pos_tool", new=execute):
-            result = await request_pos_reply(SimpleNamespace(), message, [])
+            result = await request_pos_reply(
+                SimpleNamespace(),
+                message,
+                [],
+                tool_plan=_semantic_plan(message, "kick_user"),
+            )
 
         self.assertIn("Ничего не выполнял", result)
         self.assertNotIn("инструмент", result.lower())
@@ -288,7 +321,12 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("pos_ai.pos_chat_completion", new=AsyncMock(return_value=response)), \
              patch("pos_ai.execute_pos_tool", new=execute):
-            result = await request_pos_reply(SimpleNamespace(), message, [])
+            result = await request_pos_reply(
+                SimpleNamespace(),
+                message,
+                [],
+                tool_plan=_semantic_plan(message, "kick_user"),
+            )
 
         self.assertEqual(result, "JuniperBot кикнут с сервера.")
         execute.assert_awaited_once()
@@ -306,7 +344,12 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("pos_ai.pos_chat_completion", new=AsyncMock(return_value=response)), \
              patch("pos_ai.execute_pos_tool", new=execute):
-            result = await request_pos_reply(SimpleNamespace(), message, [])
+            result = await request_pos_reply(
+                SimpleNamespace(),
+                message,
+                [],
+                tool_plan=_semantic_plan(message, "kick_user"),
+            )
 
         self.assertIn("управляющий контур", result)
         execute.assert_not_awaited()
@@ -330,7 +373,13 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("pos_ai.pos_chat_completion", new=chat), \
              patch("pos_ai.execute_pos_tool", new=execute):
-            result = await request_pos_reply(SimpleNamespace(), message, [], state=state)
+            result = await request_pos_reply(
+                SimpleNamespace(),
+                message,
+                [],
+                state=state,
+                tool_plan=_semantic_plan(message, "kick_user"),
+            )
 
         self.assertEqual(result, "JuniperBot кикнут с сервера.")
         self.assertTrue(state["tools_executed"])
@@ -357,7 +406,12 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
             "pos_ai.execute_pos_tool",
             new=execute,
         ):
-            result = await request_pos_reply(SimpleNamespace(), message, [])
+            result = await request_pos_reply(
+                SimpleNamespace(),
+                message,
+                [],
+                tool_plan=_semantic_plan(message, "kick_user"),
+            )
 
         self.assertIn("кикнут с сервера", result)
         execute.assert_awaited_once()
@@ -466,6 +520,35 @@ class CurrentMessageTargetTests(unittest.TestCase):
             reference=None,
         )
         self.assertIsNone(_message_target_user_id(message, bot))
+
+
+class ProtectedToolTargetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pos_id_is_rejected_before_unban_lookup(self):
+        bot_id = 1393592093137440838
+        guild_id = 1352394387362939003
+        guild = SimpleNamespace(
+            id=guild_id,
+            name="Test",
+            me=SimpleNamespace(guild_permissions=SimpleNamespace(ban_members=True)),
+            fetch_ban=AsyncMock(),
+        )
+        bot = SimpleNamespace(
+            user=SimpleNamespace(id=bot_id),
+            guilds=[guild],
+            get_guild=lambda requested: guild if requested == guild_id else None,
+        )
+        message = SimpleNamespace(guild=guild)
+
+        _args, _user_id, _guild, _labels, error = await _prepare_mutating_tool_action(
+            bot,
+            message,
+            "unban_user",
+            {"server_id_or_name": str(guild_id), "user_id": str(bot_id)},
+            bot_id,
+        )
+
+        self.assertEqual(error, "целью является сам P.OS")
+        guild.fetch_ban.assert_not_awaited()
 
 class RestoreFallbackTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):

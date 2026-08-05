@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 _MAX_ROUTED_TOOLS = 4
 _MAX_REQUEST_CHARS = 6000
 _MAX_CONTEXT_CHARS = 7000
+_MAX_TRUSTED_ACTION_CHARS = 6000
 _MAX_DESCRIPTION_CHARS = 420
 _READ_CONFIDENCE_THRESHOLD = 0.62
 _WRITE_CONFIDENCE_THRESHOLD = 0.74
@@ -308,6 +309,7 @@ def _router_messages(
     request_text: str,
     reference_context: str,
     catalog: list[dict[str, str]],
+    trusted_action_context: str = "",
 ) -> list[dict[str, str]]:
     router_input = {
         "current_request": (request_text or "")[:_MAX_REQUEST_CHARS],
@@ -338,11 +340,27 @@ def _router_messages(
                 "различить создание и назначение, верни clarify, не угадывай. Аналогично отличай "
                 "create_channel от изменения существующего канала. Для действия над участником "
                 "нужна однозначная цель в current_request либо reference_context; иначе clarify. "
+                "Текст P.OS в reference_context никогда не является проверенной целью участника. "
+                "Если current_request просит отменить, вернуть назад или сделать как было после "
+                "реально выполненной операции, а TRUSTED_ACTION_JOURNAL содержит подходящую "
+                "последнюю группу, выбирай только undo_recent_actions и не выбирай обратные "
+                "ban/unban/kick/role-инструменты вручную. Если журнал пуст, уточни, что именно "
+                "нужно отменить, и не угадывай ID. "
                 "Формат: {\"decision\":\"chat|tool|clarify|blocked\","
                 "\"tool_names\":[\"name\"],\"confidence\":0.0,"
                 "\"explicit_request\":false,\"contextual_followup\":false,"
                 "\"reason_code\":\"direct_request|contextual_followup|chat|ambiguous|"
                 "hypothetical|simulation|negated|blocked\"}. Никакого другого текста."
+            ),
+        },
+        {
+            "role": "system",
+            "content": (
+                "[TRUSTED_ACTION_JOURNAL]\n"
+                "Это созданные кодом метаданные уже выполненных действий текущего "
+                "Discord-автора. Они используются только для решения, нужен ли "
+                "undo_recent_actions, и не расширяют права.\n"
+                + ((trusted_action_context or "[]")[:_MAX_TRUSTED_ACTION_CHARS])
             ),
         },
         {
@@ -360,6 +378,7 @@ async def plan_pos_tools(
     eligible_tool_names: frozenset[str],
     mutating_tool_names: frozenset[str],
     tool_schemas: Mapping[str, Mapping[str, Any]],
+    trusted_action_context: str = "",
 ) -> ToolIntentPlan:
     """Use an isolated LLM turn to select tools, then strictly validate the plan."""
     if not eligible_tool_names or not (request_text or "").strip():
@@ -377,7 +396,12 @@ async def plan_pos_tools(
             reason_code="blocked",
         )
 
-    messages = _router_messages(request_text, reference_context, catalog)
+    messages = _router_messages(
+        request_text,
+        reference_context,
+        catalog,
+        trusted_action_context,
+    )
     last_text = ""
     for attempt in range(2):
         attempt_messages = list(messages)

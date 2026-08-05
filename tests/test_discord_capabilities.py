@@ -55,6 +55,19 @@ class ExtendedCapabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("dms_disabled_until", kwargs)
         self.assertIn("обновлены", result)
 
+    async def test_invalid_server_safety_boolean_is_rejected(self):
+        guild = SimpleNamespace(name="Test", edit=AsyncMock())
+
+        result = await discord_capabilities.execute_extended_capability(
+            guild,
+            SimpleNamespace(),
+            "set_server_safety",
+            {"invites_disabled": "maybe"},
+        )
+
+        self.assertIn("true или false", result)
+        guild.edit.assert_not_awaited()
+
     async def test_keyword_automod_rule_is_created_enabled(self):
         created_rule = SimpleNamespace(
             id=123456789012345678,
@@ -85,6 +98,27 @@ class ExtendedCapabilityTests(unittest.IsolatedAsyncioTestCase):
             ["free nitro", "wallet connect"],
         )
         self.assertIn("создано", result)
+
+    async def test_invalid_automod_enabled_value_is_rejected(self):
+        guild = SimpleNamespace(
+            name="Test",
+            create_automod_rule=AsyncMock(),
+        )
+
+        result = await discord_capabilities.execute_extended_capability(
+            guild,
+            SimpleNamespace(),
+            "manage_automod_rule",
+            {
+                "action": "create_keyword",
+                "name": "Scam links",
+                "keywords": "free nitro",
+                "enabled": "sometimes",
+            },
+        )
+
+        self.assertIn("true или false", result)
+        guild.create_automod_rule.assert_not_awaited()
 
     async def test_unknown_scheduled_event_type_never_falls_back_to_voice(self):
         guild = SimpleNamespace(

@@ -47,6 +47,7 @@ COGS = [
     "cogs.security",
     "cogs.logging_events",
     "cogs.mod",
+    "cogs.telegram_bridge",
     "cogs.ai_chat",
 ]
 

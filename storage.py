@@ -25,6 +25,7 @@ import shutil
 import sqlite3
 import tempfile
 import time
+from typing import Any
 from weakref import WeakKeyDictionary
 
 import discord
@@ -160,6 +161,76 @@ async def _init_db_unlocked(db_path: str) -> None:
         )
     """)
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_event_recipient_user ON ai_event_recipients(user_id, event_id)")
+    # Structured execution journal. Unlike ai_event_log summaries, these rows
+    # are machine-readable and can safely drive a deterministic undo without
+    # asking the language model to rediscover IDs from prose.
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS pos_tool_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            source_guild_id INTEGER NOT NULL,
+            source_channel_id INTEGER,
+            source_message_id INTEGER NOT NULL,
+            actor_id INTEGER NOT NULL,
+            target_guild_id INTEGER NOT NULL,
+            operation TEXT NOT NULL,
+            args_json TEXT NOT NULL,
+            result TEXT NOT NULL,
+            success INTEGER NOT NULL,
+            inverse_operation TEXT,
+            inverse_args_json TEXT,
+            undo_status TEXT NOT NULL,
+            undo_started_at INTEGER,
+            undone_at INTEGER,
+            undo_result TEXT
+        )
+    """)
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pos_actions_actor_source "
+        "ON pos_tool_actions(actor_id, source_guild_id, source_channel_id, ts DESC, id DESC)"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pos_actions_message "
+        "ON pos_tool_actions(source_message_id, id)"
+    )
+    # Telegram bridge requests are durable so retries cannot duplicate an
+    # owner notification and Telegram replies stay bound to the Discord author.
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS telegram_contact_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at INTEGER NOT NULL,
+            guild_id INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            discord_message_id INTEGER NOT NULL UNIQUE,
+            discord_user_id INTEGER NOT NULL,
+            discord_username TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            message_text TEXT NOT NULL,
+            urgency TEXT NOT NULL,
+            urgency_reason TEXT NOT NULL,
+            status TEXT NOT NULL,
+            telegram_message_id INTEGER UNIQUE,
+            response_text TEXT,
+            responded_at INTEGER,
+            delivery_target TEXT,
+            delivery_error TEXT
+        )
+    """)
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tg_contact_user_time "
+        "ON telegram_contact_requests(discord_user_id, created_at DESC)"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tg_contact_status_time "
+        "ON telegram_contact_requests(status, created_at DESC)"
+    )
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS integration_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+    """)
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS security_state (
             guild_id INTEGER PRIMARY KEY,
@@ -604,6 +675,536 @@ async def search_ai_events(
         "summary", "details", "deleted",
     ]
     return [dict(zip(keys, row)) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Structured P.OS tool action journal
+# ---------------------------------------------------------------------------
+
+_ACTION_JSON_LIMIT = 20_000
+_ACTION_RESULT_LIMIT = 8_000
+_ACTION_UNDO_STATUSES = {
+    "ready",
+    "not_reversible",
+    "not_applicable",
+    "in_progress",
+    "undone",
+    "failed",
+    "acknowledged",
+}
+
+
+def _bounded_json(value: dict | list | None, *, limit: int = _ACTION_JSON_LIMIT) -> str:
+    text = json.dumps(value or {}, ensure_ascii=False, sort_keys=True, default=str)
+    if len(text) > limit:
+        raise ValueError("structured action payload is too large")
+    return text
+
+
+def _decode_json_object(value: object) -> dict:
+    try:
+        decoded = json.loads(str(value or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+async def record_pos_tool_action(
+    *,
+    source_guild_id: int,
+    source_channel_id: int | None,
+    source_message_id: int,
+    actor_id: int,
+    target_guild_id: int,
+    operation: str,
+    args: dict,
+    result: str,
+    success: bool,
+    inverse_operation: str | None = None,
+    inverse_args: dict | None = None,
+    ts: int | None = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> int:
+    if min(source_guild_id, source_message_id, actor_id, target_guild_id) <= 0:
+        raise ValueError("action journal IDs must be positive")
+    operation_text = str(operation or "").strip()[:100]
+    if not operation_text:
+        raise ValueError("operation is required")
+    inverse_name = str(inverse_operation or "").strip()[:100] or None
+    undo_status = (
+        "not_applicable"
+        if not success
+        else "ready" if inverse_name else "not_reversible"
+    )
+    args_text = _bounded_json(args)
+    inverse_text = _bounded_json(inverse_args) if inverse_name else None
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        cursor = await conn.execute(
+            """
+            INSERT INTO pos_tool_actions (
+                ts, source_guild_id, source_channel_id, source_message_id,
+                actor_id, target_guild_id, operation, args_json, result,
+                success, inverse_operation, inverse_args_json, undo_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(ts or time.time()),
+                int(source_guild_id),
+                int(source_channel_id) if source_channel_id else None,
+                int(source_message_id),
+                int(actor_id),
+                int(target_guild_id),
+                operation_text,
+                args_text,
+                str(result or "")[:_ACTION_RESULT_LIMIT],
+                int(bool(success)),
+                inverse_name,
+                inverse_text,
+                undo_status,
+            ),
+        )
+        await conn.commit()
+        if cursor.lastrowid is None:
+            raise RuntimeError("SQLite did not return an action journal ID")
+        return int(cursor.lastrowid)
+
+
+def _action_row_to_dict(row: Any) -> dict:
+    keys = [
+        "id",
+        "ts",
+        "source_guild_id",
+        "source_channel_id",
+        "source_message_id",
+        "actor_id",
+        "target_guild_id",
+        "operation",
+        "args_json",
+        "result",
+        "success",
+        "inverse_operation",
+        "inverse_args_json",
+        "undo_status",
+        "undo_started_at",
+        "undone_at",
+        "undo_result",
+    ]
+    item = dict(zip(keys, row))
+    item["args"] = _decode_json_object(item.pop("args_json"))
+    item["inverse_args"] = _decode_json_object(item.pop("inverse_args_json"))
+    item["success"] = bool(item["success"])
+    return item
+
+
+async def list_recent_pos_tool_actions(
+    *,
+    actor_id: int,
+    source_guild_id: int,
+    source_channel_id: int | None = None,
+    limit: int = 12,
+    db_path: str = DEFAULT_DB_PATH,
+) -> list[dict]:
+    conn = await _get_conn(db_path)
+    channel_filter = int(source_channel_id) if source_channel_id else None
+    cursor = await conn.execute(
+        """
+        SELECT id, ts, source_guild_id, source_channel_id, source_message_id,
+               actor_id, target_guild_id, operation, args_json, result, success,
+               inverse_operation, inverse_args_json, undo_status,
+               undo_started_at, undone_at, undo_result
+        FROM pos_tool_actions
+        WHERE actor_id = ? AND source_guild_id = ?
+          AND (? IS NULL OR source_channel_id = ?)
+        ORDER BY ts DESC, id DESC
+        LIMIT ?
+        """,
+        (
+            int(actor_id),
+            int(source_guild_id),
+            channel_filter,
+            channel_filter,
+            max(1, min(int(limit), 50)),
+        ),
+    )
+    return [_action_row_to_dict(row) for row in await cursor.fetchall()]
+
+
+async def claim_recent_pos_action_group(
+    *,
+    actor_id: int,
+    source_guild_id: int,
+    source_channel_id: int | None,
+    within_seconds: int = 30 * 60,
+    db_path: str = DEFAULT_DB_PATH,
+) -> list[dict]:
+    """Atomically claim the latest not-yet-handled action group for undo."""
+    now = int(time.time())
+    cutoff = now - max(60, min(int(within_seconds), 24 * 60 * 60))
+    stale_cutoff = now - 5 * 60
+    channel_filter = int(source_channel_id) if source_channel_id else None
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        # A crashed worker may leave a claim behind. Re-open it after five
+        # minutes; normal duplicate requests still fail closed.
+        await conn.execute(
+            "UPDATE pos_tool_actions SET undo_status = 'ready', undo_started_at = NULL "
+            "WHERE undo_status = 'in_progress' AND undo_started_at < ? "
+            "AND inverse_operation IS NOT NULL",
+            (stale_cutoff,),
+        )
+        cursor = await conn.execute(
+            """
+            SELECT source_message_id
+            FROM pos_tool_actions
+            WHERE actor_id = ? AND source_guild_id = ? AND ts >= ?
+              AND (? IS NULL OR source_channel_id = ?)
+              AND success = 1
+              AND undo_status IN ('ready', 'failed', 'not_reversible')
+            ORDER BY ts DESC, id DESC
+            LIMIT 1
+            """,
+            (
+                int(actor_id),
+                int(source_guild_id),
+                cutoff,
+                channel_filter,
+                channel_filter,
+            ),
+        )
+        group_row = await cursor.fetchone()
+        if not group_row:
+            await conn.commit()
+            return []
+        source_message_id = int(group_row[0])
+        await conn.execute(
+            "UPDATE pos_tool_actions SET undo_status = 'in_progress', undo_started_at = ? "
+            "WHERE source_message_id = ? AND actor_id = ? "
+            "AND undo_status IN ('ready', 'failed')",
+            (now, source_message_id, int(actor_id)),
+        )
+        rows_cursor = await conn.execute(
+            """
+            SELECT id, ts, source_guild_id, source_channel_id, source_message_id,
+                   actor_id, target_guild_id, operation, args_json, result, success,
+                   inverse_operation, inverse_args_json, undo_status,
+                   undo_started_at, undone_at, undo_result
+            FROM pos_tool_actions
+            WHERE source_message_id = ? AND actor_id = ? AND success = 1
+              AND undo_status IN ('in_progress', 'not_reversible')
+            ORDER BY id DESC
+            """,
+            (source_message_id, int(actor_id)),
+        )
+        rows = await rows_cursor.fetchall()
+        await conn.commit()
+    return [_action_row_to_dict(row) for row in rows]
+
+
+async def finish_pos_action_undo(
+    action_id: int,
+    *,
+    status: str,
+    result: str,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    normalized = str(status or "").strip().lower()
+    if normalized not in {"undone", "failed", "acknowledged"}:
+        raise ValueError("invalid final undo status")
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        await conn.execute(
+            "UPDATE pos_tool_actions SET undo_status = ?, undone_at = ?, "
+            "undo_result = ? WHERE id = ? AND undo_status IN "
+            "('in_progress', 'not_reversible')",
+            (
+                normalized,
+                int(time.time()),
+                str(result or "")[:_ACTION_RESULT_LIMIT],
+                int(action_id),
+            ),
+        )
+        await conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Telegram owner bridge persistence and abuse controls
+# ---------------------------------------------------------------------------
+
+async def reserve_telegram_contact_request(
+    *,
+    guild_id: int,
+    channel_id: int,
+    discord_message_id: int,
+    discord_user_id: int,
+    discord_username: str,
+    message_text: str,
+    urgency: str,
+    urgency_reason: str,
+    min_interval_seconds: int,
+    daily_limit: int,
+    global_hourly_limit: int,
+    max_pending_per_user: int,
+    now: int | None = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> tuple[dict | None, str | None]:
+    timestamp = int(now or time.time())
+    clean_text = str(message_text or "").strip()
+    if not clean_text:
+        return None, "empty"
+    payload_hash = hashlib.sha256(clean_text.casefold().encode("utf-8", "replace")).hexdigest()
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        duplicate_cursor = await conn.execute(
+            "SELECT id, status FROM telegram_contact_requests "
+            "WHERE discord_message_id = ?",
+            (int(discord_message_id),),
+        )
+        duplicate = await duplicate_cursor.fetchone()
+        if duplicate:
+            return None, "already_processed"
+
+        cursor = await conn.execute(
+            "SELECT MAX(created_at) FROM telegram_contact_requests "
+            "WHERE discord_user_id = ? AND status != 'failed'",
+            (int(discord_user_id),),
+        )
+        row = await cursor.fetchone()
+        last_created = int(row[0]) if row and row[0] is not None else 0
+        if last_created and timestamp - last_created < max(1, min_interval_seconds):
+            return None, f"cooldown:{max(1, min_interval_seconds - (timestamp - last_created))}"
+
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM telegram_contact_requests "
+            "WHERE discord_user_id = ? AND created_at >= ? AND status != 'failed'",
+            (int(discord_user_id), timestamp - 24 * 60 * 60),
+        )
+        count_row = await cursor.fetchone()
+        if int(count_row[0] if count_row else 0) >= max(1, daily_limit):
+            return None, "daily_limit"
+
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM telegram_contact_requests "
+            "WHERE created_at >= ? AND status != 'failed'",
+            (timestamp - 60 * 60,),
+        )
+        count_row = await cursor.fetchone()
+        if int(count_row[0] if count_row else 0) >= max(1, global_hourly_limit):
+            return None, "global_limit"
+
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM telegram_contact_requests "
+            "WHERE discord_user_id = ? AND status IN ('reserved', 'sent')",
+            (int(discord_user_id),),
+        )
+        count_row = await cursor.fetchone()
+        if int(count_row[0] if count_row else 0) >= max(1, max_pending_per_user):
+            return None, "pending_limit"
+
+        cursor = await conn.execute(
+            "SELECT id FROM telegram_contact_requests "
+            "WHERE discord_user_id = ? AND payload_hash = ? "
+            "AND created_at >= ? AND status != 'failed' LIMIT 1",
+            (int(discord_user_id), payload_hash, timestamp - 24 * 60 * 60),
+        )
+        if await cursor.fetchone():
+            return None, "duplicate_content"
+
+        insert_cursor = await conn.execute(
+            """
+            INSERT INTO telegram_contact_requests (
+                created_at, guild_id, channel_id, discord_message_id,
+                discord_user_id, discord_username, payload_hash, message_text,
+                urgency, urgency_reason, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved')
+            """,
+            (
+                timestamp,
+                int(guild_id),
+                int(channel_id),
+                int(discord_message_id),
+                int(discord_user_id),
+                str(discord_username or discord_user_id)[:200],
+                payload_hash,
+                clean_text[:1600],
+                str(urgency or "normal")[:20],
+                str(urgency_reason or "")[:300],
+            ),
+        )
+        await conn.commit()
+        if insert_cursor.lastrowid is None:
+            raise RuntimeError("SQLite did not return a Telegram request ID")
+        return {
+            "id": int(insert_cursor.lastrowid),
+            "created_at": timestamp,
+            "guild_id": int(guild_id),
+            "channel_id": int(channel_id),
+            "discord_message_id": int(discord_message_id),
+            "discord_user_id": int(discord_user_id),
+            "discord_username": str(discord_username or discord_user_id)[:200],
+            "message_text": clean_text[:1600],
+            "urgency": str(urgency or "normal")[:20],
+            "urgency_reason": str(urgency_reason or "")[:300],
+        }, None
+
+
+async def mark_telegram_contact_sent(
+    request_id: int,
+    telegram_message_id: int,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        await conn.execute(
+            "UPDATE telegram_contact_requests SET status = 'sent', "
+            "telegram_message_id = ?, delivery_error = NULL "
+            "WHERE id = ? AND status = 'reserved'",
+            (int(telegram_message_id), int(request_id)),
+        )
+        await conn.commit()
+
+
+async def update_telegram_contact_urgency(
+    request_id: int,
+    *,
+    urgency: str,
+    urgency_reason: str,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        await conn.execute(
+            "UPDATE telegram_contact_requests SET urgency = ?, urgency_reason = ? "
+            "WHERE id = ? AND status = 'reserved'",
+            (
+                str(urgency or "normal")[:20],
+                str(urgency_reason or "")[:300],
+                int(request_id),
+            ),
+        )
+        await conn.commit()
+
+
+async def mark_telegram_contact_failed(
+    request_id: int,
+    error: str,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        await conn.execute(
+            "UPDATE telegram_contact_requests SET status = 'failed', "
+            "delivery_error = ? WHERE id = ? AND status = 'reserved'",
+            (str(error or "delivery failed")[:500], int(request_id)),
+        )
+        await conn.commit()
+
+
+async def get_telegram_contact_by_message(
+    telegram_message_id: int,
+    db_path: str = DEFAULT_DB_PATH,
+) -> dict | None:
+    conn = await _get_conn(db_path)
+    cursor = await conn.execute(
+        """
+        SELECT id, created_at, guild_id, channel_id, discord_message_id,
+               discord_user_id, discord_username, message_text, urgency,
+               urgency_reason, status, telegram_message_id, response_text,
+               responded_at, delivery_target, delivery_error
+        FROM telegram_contact_requests
+        WHERE telegram_message_id = ?
+        """,
+        (int(telegram_message_id),),
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return None
+    keys = [
+        "id", "created_at", "guild_id", "channel_id", "discord_message_id",
+        "discord_user_id", "discord_username", "message_text", "urgency",
+        "urgency_reason", "status", "telegram_message_id", "response_text",
+        "responded_at", "delivery_target", "delivery_error",
+    ]
+    return dict(zip(keys, row))
+
+
+async def claim_telegram_contact_response(
+    request_id: int,
+    *,
+    response_text: str,
+    db_path: str = DEFAULT_DB_PATH,
+) -> bool:
+    """Claim one owner reply before Discord delivery to suppress duplicates."""
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        cursor = await conn.execute(
+            "UPDATE telegram_contact_requests SET status = 'responding', "
+            "response_text = ?, responded_at = ?, delivery_error = NULL "
+            "WHERE id = ? AND status = 'sent'",
+            (
+                str(response_text or "")[:2000],
+                int(time.time()),
+                int(request_id),
+            ),
+        )
+        await conn.commit()
+        return cursor.rowcount > 0
+
+
+async def complete_telegram_contact_response(
+    request_id: int,
+    *,
+    response_text: str,
+    delivery_target: str,
+    delivery_error: str | None = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> bool:
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        cursor = await conn.execute(
+            "UPDATE telegram_contact_requests SET status = ?, response_text = ?, "
+            "responded_at = ?, delivery_target = ?, delivery_error = ? "
+            "WHERE id = ? AND status = 'responding'",
+            (
+                "delivered" if not delivery_error else "delivery_failed",
+                str(response_text or "")[:2000],
+                int(time.time()),
+                str(delivery_target or "")[:40],
+                str(delivery_error or "")[:500] or None,
+                int(request_id),
+            ),
+        )
+        await conn.commit()
+        return cursor.rowcount > 0
+
+
+async def get_integration_state(
+    key: str,
+    db_path: str = DEFAULT_DB_PATH,
+) -> str | None:
+    conn = await _get_conn(db_path)
+    cursor = await conn.execute(
+        "SELECT value FROM integration_state WHERE key = ?",
+        (str(key)[:100],),
+    )
+    row = await cursor.fetchone()
+    return str(row[0]) if row else None
+
+
+async def set_integration_state(
+    key: str,
+    value: str,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    async with _loop_lock(_write_locks):
+        conn = await _get_conn(db_path)
+        await conn.execute(
+            "INSERT INTO integration_state (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "updated_at = excluded.updated_at",
+            (str(key)[:100], str(value)[:2000], int(time.time())),
+        )
+        await conn.commit()
 
 
 # ---------------------------------------------------------------------------

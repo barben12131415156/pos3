@@ -57,6 +57,27 @@ def _env_int_list(name: str) -> list[int]:
 VIRUSTOTAL_KEY = os.getenv("VIRUSTOTAL_KEY")
 GOOGLE_SAFEBROWSING_KEY = os.getenv("GOOGLE_SAFEBROWSING_KEY")
 BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY")
+# Telegram is an optional, isolated owner bridge. It never uses a personal
+# Telegram session: only a dedicated Bot API token and exact owner IDs are
+# accepted. Missing values disable the bridge without affecting Discord.
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+TELEGRAM_OWNER_USER_ID = _env_int("TELEGRAM_OWNER_USER_ID", 0)
+TELEGRAM_OWNER_CHAT_ID = _env_int("TELEGRAM_OWNER_CHAT_ID", 0)
+TELEGRAM_CONTACT_MIN_INTERVAL_SECONDS = _env_int_bounded(
+    "TELEGRAM_CONTACT_MIN_INTERVAL_SECONDS", 300, 30, 86_400
+)
+TELEGRAM_CONTACT_DAILY_LIMIT = _env_int_bounded(
+    "TELEGRAM_CONTACT_DAILY_LIMIT", 5, 1, 100
+)
+TELEGRAM_CONTACT_GLOBAL_HOURLY_LIMIT = _env_int_bounded(
+    "TELEGRAM_CONTACT_GLOBAL_HOURLY_LIMIT", 20, 1, 500
+)
+TELEGRAM_CONTACT_MAX_PENDING_PER_USER = _env_int_bounded(
+    "TELEGRAM_CONTACT_MAX_PENDING_PER_USER", 2, 1, 20
+)
+TELEGRAM_POLL_TIMEOUT_SECONDS = _env_int_bounded(
+    "TELEGRAM_POLL_TIMEOUT_SECONDS", 25, 5, 50
+)
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat"
 GITHUB_MODELS_TOKEN = os.getenv("GITHUB_MODELS_TOKEN")

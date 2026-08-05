@@ -237,7 +237,8 @@ POS_AI_TOOLS = [
                     "topic": {"type": "string", "description": "Необязательно. Новое описание (topic)."},
                     "slowmode_seconds": {"type": "string", "description": "Необязательно. Медленный режим в секундах (0 — выключить, до 21600)."},
                     "nsfw": {"type": "string", "description": "Необязательно. 'true'/'false' — пометить канал как NSFW."},
-                    "category_id_or_name": {"type": "string", "description": "Необязательно. Переместить канал в эту категорию (ID или имя)."}
+                    "category_id_or_name": {"type": "string", "description": "Необязательно. Переместить канал в эту категорию (ID или имя)."},
+                    "position": {"type": "string", "description": "Необязательно. Новая позиция канала внутри списка/категории, начиная с 0."}
                 },
                 "required": ["channel_id_or_name"]
             }
@@ -690,6 +691,99 @@ POS_AI_TOOLS.extend([
                 "required": ["preset"]
             }
         }
+    },
+])
+
+POS_AI_TOOLS.extend([
+    {
+        "type": "function",
+        "function": {
+            "name": "list_bans",
+            "description": "Показывает фактический бан-лист выбранного сервера с Discord ID и причинами. Только для Пумбы.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "string", "description": "Количество записей, 1-100; по умолчанию 25."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_threads",
+            "description": "Показывает фактические активные ветки сервера, их родителей и состояние.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_poll",
+            "description": "Создаёт нативный Discord-опрос в точном канале. Не имитирует опрос текстом.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_id_or_name": {"type": "string", "description": "Точный канал для опроса."},
+                    "question": {"type": "string", "description": "Вопрос опроса."},
+                    "answers": {"type": "string", "description": "От 2 до 10 вариантов, каждый с новой строки или через точку с запятой."},
+                    "duration_hours": {"type": "string", "description": "Длительность в часах, 1-168; по умолчанию 24."},
+                    "allow_multiselect": {"type": "string", "description": "true/false: можно ли выбрать несколько вариантов."},
+                },
+                "required": ["channel_id_or_name", "question", "answers"],
+            },
+        },
+    },
+])
+
+
+# Contextual control tools. Both intentionally have no model-provided target:
+# undo resolves exact IDs from the trusted execution journal, while Telegram
+# forwards the current Discord message verbatim from verified message metadata.
+POS_AI_TOOLS.extend([
+    {
+        "type": "function",
+        "function": {
+            "name": "undo_recent_actions",
+            "description": (
+                "Отменяет последнюю группу реально выполненных P.OS действий из "
+                "структурированного журнала. Используй для контекстных просьб вроде "
+                "'верни всё обратно', 'отмени это', 'сделай как было'. Не выбирай "
+                "ban/unban/kick и не угадывай пользователя заново."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "within_minutes": {
+                        "type": "string",
+                        "description": "Необязательно. Искать последнюю группу за 1-1440 минут; по умолчанию 30.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "contact_pumba_telegram",
+            "description": (
+                "Безопасно передаёт Пумбе в рабочий Telegram точный текущий запрос "
+                "Discord-пользователя. Используй только когда пользователь явно просит "
+                "написать, передать или связаться с Пумбой через Telegram. Текст, адрес "
+                "и срочность код берёт сам; аргументы не нужны."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
     },
 ])
 
@@ -1219,6 +1313,7 @@ _CROSS_SERVER_TOOLS = {
     "set_server_safety", "list_emojis", "manage_emoji", "list_stickers",
     "manage_sticker",
     "refresh_server_memory",
+    "list_bans", "list_threads", "send_poll",
 }
 
 _USER_IDENTIFIER_TOOLS = {
@@ -1285,6 +1380,8 @@ _TOOL_FIELD_MAX_LENGTHS = {
     "max_sources": 2,
     "settings_json": 8000,
     "user_identifiers": 5000,
+    "answers": 1000,
+    "position": 8,
 }
 
 

@@ -272,6 +272,51 @@ class SemanticToolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("фактически исключён", result)
         execute.assert_awaited_once()
 
+    async def test_multi_action_plan_repairs_missing_call_before_execution(self):
+        target_id = 1351879409832951893
+        message = _message(f"выкинь с сервера и забань <@{target_id}>")
+        plan = ToolIntentPlan.for_tools(message, {"kick_user", "ban_user"})
+        kick_call = {
+            "tool_calls": [{
+                "id": "kick",
+                "function": {
+                    "name": "kick_user",
+                    "arguments": json.dumps({"user_id": str(target_id)}),
+                },
+            }]
+        }
+        ban_call = {
+            "tool_calls": [{
+                "id": "ban",
+                "function": {
+                    "name": "ban_user",
+                    "arguments": json.dumps({"user_id": str(target_id)}),
+                },
+            }]
+        }
+        chat = AsyncMock(side_effect=[kick_call, ban_call])
+        execute = AsyncMock(side_effect=["Кик выполнен.", "Бан выполнен."])
+        with patch("pos_ai.pos_chat_completion", new=chat), patch(
+            "pos_ai.execute_pos_tool",
+            new=execute,
+        ):
+            result = await request_pos_reply(
+                SimpleNamespace(user=SimpleNamespace(id=999)),
+                message,
+                [],
+                tool_plan=plan,
+            )
+
+        self.assertEqual(chat.await_count, 2)
+        self.assertEqual(execute.await_count, 2)
+        executed_names = [
+            call.args[2]["function"]["name"]
+            for call in execute.await_args_list
+        ]
+        self.assertEqual(executed_names, ["kick_user", "ban_user"])
+        self.assertIn("Кик выполнен", result)
+        self.assertIn("Бан выполнен", result)
+
     def test_actor_scope_exposes_ignore_only_to_creator(self):
         owner = _message("тест")
         outsider = _message("тест", actor_id=123456789012345678)
@@ -302,7 +347,7 @@ class SemanticToolRouterTests(unittest.IsolatedAsyncioTestCase):
         planner = AsyncMock(return_value=expected)
 
         with patch("pos_ai.plan_pos_tools", new=planner):
-            _plan, context = await _plan_tool_intent_for_message(
+            _plan, context, trusted_context = await _plan_tool_intent_for_message(
                 message,
                 SimpleNamespace(user=bot_user),
                 ref_msg,
@@ -310,9 +355,10 @@ class SemanticToolRouterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("reply-target: Attacker", context)
         self.assertIn("POS-CONTEXT", context)
-        self.assertIn("Как поступить", context)
+        self.assertNotIn("Как поступить", context)
         self.assertNotIn("ignore previous", context)
         self.assertNotIn("удали сервер", context)
+        self.assertEqual(trusted_context, "[]")
 
 
 class IgnorePersistenceTests(unittest.IsolatedAsyncioTestCase):

@@ -12,6 +12,13 @@ import discord
 
 MAX_ASSET_BYTES = 512 * 1024
 _NamedDiscordObject = TypeVar("_NamedDiscordObject")
+EXTENDED_CAPABILITY_NAMES = frozenset({
+    "manage_message", "manage_reaction", "list_invites", "revoke_invite",
+    "list_webhooks", "delete_webhook", "list_automod_rules", "manage_automod_rule",
+    "list_scheduled_events", "manage_scheduled_event", "create_forum_post",
+    "set_server_safety", "list_emojis", "manage_emoji", "list_stickers",
+    "manage_sticker",
+})
 
 
 def _digits(value: object) -> int | None:
@@ -22,9 +29,19 @@ def _digits(value: object) -> int | None:
 def _parse_bool(value: object, default: bool = False) -> bool:
     if value in (None, ""):
         return default
-    return str(value).strip().casefold() in {
-        "1", "true", "yes", "on", "да", "вкл", "включить",
-    }
+    parsed = _parse_bool_strict(value)
+    return default if parsed is None else parsed
+
+
+def _parse_bool_strict(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().casefold()
+    if normalized in {"1", "true", "yes", "on", "да", "вкл", "включить"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "нет", "выкл", "выключить"}:
+        return False
+    return None
 
 
 def _split_values(value: object, limit: int) -> list[str]:
@@ -101,8 +118,8 @@ def _parse_datetime(value: object) -> dt.datetime | None:
         parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
     return parsed.astimezone(dt.timezone.utc)
 
 
@@ -199,7 +216,10 @@ async def _list_invites(guild: discord.Guild) -> str:
 
 async def _revoke_invite(guild: discord.Guild, args: dict[str, Any]) -> str:
     raw = str(args.get("invite_code_or_url") or "").strip()
-    code = raw.rstrip("/").rsplit("/", 1)[-1]
+    try:
+        code = discord.utils.resolve_invite(raw).code
+    except Exception:
+        code = raw.rstrip("/").rsplit("/", 1)[-1].split("?", 1)[0]
     invite = next(
         (item for item in await guild.invites() if item.code == code),
         None,
@@ -300,6 +320,9 @@ async def _manage_automod_rule(
         name = str(args.get("name") or "").strip()[:100]
         if not name:
             return "Ошибка: для правила AutoMod нужно имя."
+        enabled = _parse_bool_strict(args.get("enabled"))
+        if args.get("enabled") not in (None, "") and enabled is None:
+            return "Ошибка: enabled должен быть true или false."
         actions, error = _automod_actions(guild, args)
         if error:
             return f"Ошибка: {error}."
@@ -323,20 +346,23 @@ async def _manage_automod_rule(
                 )
             except ValueError:
                 return "Ошибка: mention_limit должен быть целым числом."
+            mention_raid = _parse_bool_strict(args.get("mention_raid_protection"))
+            if (
+                args.get("mention_raid_protection") not in (None, "")
+                and mention_raid is None
+            ):
+                return "Ошибка: mention_raid_protection должен быть true или false."
             trigger = discord.AutoModTrigger(
                 type=discord.AutoModRuleTriggerType.mention_spam,
                 mention_limit=mention_limit,
-                mention_raid_protection=_parse_bool(
-                    args.get("mention_raid_protection"),
-                    True,
-                ),
+                mention_raid_protection=True if mention_raid is None else mention_raid,
             )
         created_rule = await guild.create_automod_rule(
             name=name,
             event_type=discord.AutoModRuleEventType.message_send,
             trigger=trigger,
             actions=actions,
-            enabled=_parse_bool(args.get("enabled"), True),
+            enabled=True if enabled is None else enabled,
             reason=reason,
         )
         return (
@@ -467,6 +493,33 @@ async def _manage_scheduled_event(
             kwargs["start_time"] = start
         if end is not None:
             kwargs["end_time"] = end
+        requested_type = str(args.get("event_type") or "").strip().casefold()
+        if requested_type and requested_type not in {"external", "stage", "voice"}:
+            return "Ошибка: event_type должен быть external, stage или voice."
+        channel_raw = str(args.get("channel_id_or_name") or "").strip()
+        if requested_type == "external":
+            location = str(args.get("location") or "").strip()[:100]
+            if not location:
+                return "Ошибка: при смене типа события на external нужна location."
+            kwargs["entity_type"] = discord.EntityType.external
+            kwargs["channel"] = None
+            kwargs["location"] = location
+        elif requested_type in {"stage", "voice"}:
+            channel = _resolve_channel(guild, channel_raw)
+            expected = discord.StageChannel if requested_type == "stage" else discord.VoiceChannel
+            if not isinstance(channel, expected):
+                return f"Ошибка: при смене типа на `{requested_type}` нужен точный подходящий канал."
+            kwargs["entity_type"] = (
+                discord.EntityType.stage_instance
+                if requested_type == "stage"
+                else discord.EntityType.voice
+            )
+            kwargs["channel"] = channel
+        elif channel_raw:
+            channel = _resolve_channel(guild, channel_raw)
+            if not isinstance(channel, (discord.StageChannel, discord.VoiceChannel)):
+                return "Ошибка: voice/stage-канал события не найден однозначно."
+            kwargs["channel"] = channel
         if not kwargs:
             return "Ошибка: не указаны поля события для изменения."
         await target_event.edit(reason=reason, **kwargs)
@@ -502,11 +555,15 @@ async def _set_server_safety(
 ) -> str:
     kwargs: dict[str, Any] = {}
     if args.get("invites_disabled") not in (None, ""):
-        kwargs["invites_disabled"] = _parse_bool(args["invites_disabled"])
+        invites_disabled = _parse_bool_strict(args["invites_disabled"])
+        if invites_disabled is None:
+            return "Ошибка: invites_disabled должен быть true или false."
+        kwargs["invites_disabled"] = invites_disabled
     if args.get("raid_alerts_enabled") not in (None, ""):
-        kwargs["raid_alerts_disabled"] = not _parse_bool(
-            args["raid_alerts_enabled"]
-        )
+        raid_alerts_enabled = _parse_bool_strict(args["raid_alerts_enabled"])
+        if raid_alerts_enabled is None:
+            return "Ошибка: raid_alerts_enabled должен быть true или false."
+        kwargs["raid_alerts_disabled"] = not raid_alerts_enabled
     safety_channel_raw = str(
         args.get("safety_alerts_channel_id_or_name") or ""
     ).strip()
@@ -685,6 +742,8 @@ async def execute_extended_capability(
     args: dict[str, Any],
 ) -> str | None:
     """Execute one extended capability; return ``None`` for unknown names."""
+    if name not in EXTENDED_CAPABILITY_NAMES:
+        return None
     try:
         if name == "manage_message":
             return await _manage_message(guild, args)
