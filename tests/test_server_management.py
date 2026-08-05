@@ -40,6 +40,8 @@ class ToolSchemaTests(unittest.TestCase):
             "remember_fact", "list_memory_entries", "delete_memory_entry",
             "refresh_server_memory", "undo_recent_actions",
             "contact_pumba_telegram",
+            "enable_vacation_mode", "disable_vacation_mode",
+            "vacation_mode_status",
         ]:
             self.assertIn(expected, names, f"tool {expected} отсутствует в схеме")
 
@@ -115,6 +117,7 @@ class ToolSchemaTests(unittest.TestCase):
             "research_web",
             "read_web_page",
             "runtime_status",
+            "vacation_mode_status",
         ]:
             self.assertIn(name, _OWNER_INFO_TOOLS)
 

@@ -4,6 +4,7 @@ import logging
 
 from pos_ai import handle_pos_ai
 from message_gate import wait_for_moderation
+from vacation_mode import handle_owner_vacation_ping
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,8 @@ class AIChatCog(commands.Cog):
             if moderation_result is not False:
                 if moderation_result is None:
                     logger.error("Moderation gate timed out for message %s; AI reply suppressed.", message.id)
+                return
+            if await handle_owner_vacation_ping(message):
                 return
             if await handle_pos_ai(message, self.bot):
                 return

@@ -742,9 +742,9 @@ POS_AI_TOOLS.extend([
 ])
 
 
-# Contextual control tools. Both intentionally have no model-provided target:
-# undo resolves exact IDs from the trusted execution journal, while Telegram
-# forwards the current Discord message verbatim from verified message metadata.
+# Contextual control tools. They intentionally have no model-provided target:
+# undo resolves exact IDs from the trusted execution journal, Telegram forwards
+# the current Discord message, and vacation mode is bound to Pumba in code.
 POS_AI_TOOLS.extend([
     {
         "type": "function",
@@ -777,6 +777,55 @@ POS_AI_TOOLS.extend([
                 "Discord-пользователя. Используй только когда пользователь явно просит "
                 "написать, передать или связаться с Пумбой через Telegram. Текст, адрес "
                 "и срочность код берёт сам; аргументы не нужны."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "enable_vacation_mode",
+            "description": (
+                "Включает постоянный режим отпуска Пумбы. Используй только когда "
+                "сам Пумба явно просит активировать или включить режим отпуска. "
+                "После включения P.OS отвечает на пинги Пумбы и предлагает связаться "
+                "с ним через Telegram. Аргументы не нужны."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "disable_vacation_mode",
+            "description": (
+                "Выключает постоянный режим отпуска Пумбы. Используй только когда "
+                "сам Пумба явно просит отключить, деактивировать или завершить режим "
+                "отпуска. Аргументы не нужны."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vacation_mode_status",
+            "description": (
+                "Проверяет фактическое состояние режима отпуска Пумбы. Используй "
+                "только когда Пумба спрашивает, включён ли режим отпуска. Аргументы "
+                "не нужны."
             ),
             "parameters": {
                 "type": "object",

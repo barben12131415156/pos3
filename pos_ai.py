@@ -128,7 +128,8 @@ _OWNER_ONLY_TOOLS = frozenset({
     "manage_sticker",
     "remember_fact", "list_memory_entries", "delete_memory_entry",
     "refresh_server_memory",
-    "undo_recent_actions",
+    "undo_recent_actions", "enable_vacation_mode", "disable_vacation_mode",
+    "vacation_mode_status",
     "list_bans", "list_threads", "send_poll",
 })
 
@@ -146,7 +147,7 @@ _READ_ONLY_TOOLS = frozenset({
     "list_invites", "list_webhooks", "list_automod_rules",
     "list_scheduled_events", "list_emojis", "list_stickers",
     "list_memory_entries",
-    "list_bans", "list_threads",
+    "list_bans", "list_threads", "vacation_mode_status",
 })
 
 # Owner-only information tools: non-owners are denied without disclosing data.
@@ -388,6 +389,29 @@ _TOOL_INTENT_RULES: tuple[tuple[frozenset[str], re.Pattern[str]], ...] = (
     (frozenset({"lift_restrictions"}), _intent_pattern(r"\b(?:сним\w*|убер\w*).{0,45}(?:ограничен\w*|карантин\w*)\b")),
     (frozenset({"deactivate_raid_mode"}), _intent_pattern(r"\b(?:выключ\w*|сним\w*|деактивир\w*).{0,35}(?:рейд[\s-]?режим|режим\s+рейд\w*)\b")),
     (
+        frozenset({"enable_vacation_mode"}),
+        _intent_pattern(
+            r"\b(?:активир\w*|включ\w*|запуст\w*).{0,35}"
+            r"(?:режим\w*\s+отпуск\w*|отпускн\w*\s+режим\w*|vacation\s+mode)\b"
+        ),
+    ),
+    (
+        frozenset({"disable_vacation_mode"}),
+        _intent_pattern(
+            r"\b(?:деактивир\w*|выключ\w*|отключ\w*|заверш\w*|сним\w*).{0,35}"
+            r"(?:режим\w*\s+отпуск\w*|отпускн\w*\s+режим\w*|vacation\s+mode)\b"
+        ),
+    ),
+    (
+        frozenset({"vacation_mode_status"}),
+        _intent_pattern(
+            r"\b(?:проверь|покаж\w*|скажи|статус).{0,35}"
+            r"(?:режим\w*\s+отпуск\w*|отпускн\w*\s+режим\w*|vacation\s+mode)\b|"
+            r"\b(?:режим\w*\s+отпуск\w*|отпускн\w*\s+режим\w*|vacation\s+mode)"
+            r".{0,25}(?:включ[её]н\w*|активен|работает)\b"
+        ),
+    ),
+    (
         frozenset({"edit_server"}),
         _intent_pattern(
             r"\b(?:измен\w*|поменя\w*|переимен\w*|настро\w*).{0,45}"
@@ -571,7 +595,7 @@ _EXPLICIT_MUTATION_PREFIX = _intent_pattern(
     r"забан\w*|разбан\w*|бан\w*|кик\w*|выкин\w*|выгон\w*|исключ\w*|"
     r"замут\w*|размут\w*|"
     r"выда\w*|добав\w*|назнач\w*|сним\w*|убер\w*|отбер\w*|"
-    r"созда\w*|сдела\w*|удал\w*|уничтож\w*|измен\w*|поменя\w*|смен\w*|сброс\w*|"
+    r"созда\w*|сдела\w*|удал\w*|уничтож\w*|измен\w*|поменя\w*|смен\w*|сброс\w*|активир\w*|"
     r"переимен\w*|настро\w*|разреш\w*|запрет\w*|включ\w*|выключ\w*|"
     r"откр\w*|закр\w*|заблокир\w*|разблокир\w*|очист\w*|архивир\w*|"
     r"разархивир\w*|отправ\w*|напиш\w*|пошл\w*|пинган\w*|пингн\w*|"
@@ -685,6 +709,8 @@ def _allowed_tool_names_for_message(message: discord.Message | None) -> frozense
     return (allowed & _MUTATING_TOOLS) - {
         "mute_ai_for_user",
         "unmute_ai_for_user",
+        "enable_vacation_mode",
+        "disable_vacation_mode",
     }
 
 
@@ -701,6 +727,8 @@ def _eligible_tool_names_for_message(
     return ((_MUTATING_TOOLS | _PUBLIC_ACTION_TOOLS) & frozenset(_TOOL_SCHEMAS_BY_NAME)) - {
         "mute_ai_for_user",
         "unmute_ai_for_user",
+        "enable_vacation_mode",
+        "disable_vacation_mode",
         "shutdown_bot",
     }
 
@@ -956,6 +984,9 @@ _TOOL_ACTION_LABELS = {
     "refresh_server_memory": "обновление серверной памяти",
     "undo_recent_actions": "откат последних действий",
     "contact_pumba_telegram": "передачу сообщения Пумбе",
+    "enable_vacation_mode": "включение режима отпуска Пумбы",
+    "disable_vacation_mode": "выключение режима отпуска Пумбы",
+    "vacation_mode_status": "проверку режима отпуска Пумбы",
 }
 
 _TOOL_ARGUMENT_LABELS = {
@@ -2128,6 +2159,40 @@ async def _perform_tool_action(
         from telegram_bridge import forward_contact_to_pumba
 
         return await forward_contact_to_pumba(bot, message)
+    if name in {
+        "enable_vacation_mode",
+        "disable_vacation_mode",
+        "vacation_mode_status",
+    }:
+        from vacation_mode import (
+            get_owner_vacation_mode,
+            set_owner_vacation_mode,
+        )
+
+        if name == "vacation_mode_status":
+            state = await get_owner_vacation_mode()
+            return (
+                "Режим отпуска активен. P.OS отвечает на пинги Пумбы и предлагает "
+                "передать сообщение через Telegram."
+                if state.enabled
+                else "Режим отпуска выключен. Автоматических ответов на пинги Пумбы нет."
+            )
+
+        enabled = name == "enable_vacation_mode"
+        _state, changed = await set_owner_vacation_mode(
+            enabled,
+            actor_id=message.author.id,
+        )
+        if enabled:
+            prefix = "Режим отпуска активирован." if changed else "Режим отпуска уже активен."
+            return (
+                f"{prefix} Пока он включён, P.OS будет отвечать на прямые и ролевые "
+                "пинги Пумбы: сообщать, что Пумба не отвечает в Discord, и предлагать "
+                "передать сообщение через Telegram. Состояние сохранено и останется "
+                "активным до команды Пумбы отключить режим."
+            )
+        prefix = "Режим отпуска отключён." if changed else "Режим отпуска уже выключен."
+        return f"{prefix} P.OS больше не будет автоматически отвечать на пинги Пумбы."
 
     if guild is None:
         return "Ошибка: эту операцию можно выполнить только на сервере."
@@ -3672,10 +3737,20 @@ async def execute_pos_tool(
     if name not in _TOOL_SCHEMAS_BY_NAME:
         return "Отказано: получена неизвестная управляющая операция."
 
-    if (
-        name in {"mute_ai_for_user", "unmute_ai_for_user"}
-        and message.author.id != POS_CREATOR_ID
-    ):
+    personal_policy_tools = {
+        "mute_ai_for_user",
+        "unmute_ai_for_user",
+        "enable_vacation_mode",
+        "disable_vacation_mode",
+        "vacation_mode_status",
+    }
+    if name in personal_policy_tools and message.author.id != POS_CREATOR_ID:
+        if name in {
+            "enable_vacation_mode",
+            "disable_vacation_mode",
+            "vacation_mode_status",
+        }:
+            return "Режим отпуска P.OS может менять и проверять только по команде Пумбы."
         return (
             "Игнор-лист P.OS меняет только Пумба. Если не хочешь ответа, "
             "просто не обращайся ко мне."
@@ -5712,6 +5787,7 @@ _DETERMINISTIC_EMPTY_ARG_TOOLS = frozenset({
     "list_memory_entries", "refresh_server_memory", "deactivate_raid_mode",
     "lock_channel", "unlock_channel",
     "undo_recent_actions", "contact_pumba_telegram",
+    "enable_vacation_mode", "disable_vacation_mode", "vacation_mode_status",
 })
 
 

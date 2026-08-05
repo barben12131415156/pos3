@@ -8,12 +8,17 @@ from typing import Any, Mapping
 
 import discord
 
+from config import POS_CREATOR_ID
 from storage import (
     claim_recent_pos_action_group,
     delete_entry,
     finish_pos_action_undo,
     is_ai_muted,
     set_ai_muted_user,
+)
+from vacation_mode import (
+    is_owner_vacation_mode_enabled,
+    set_owner_vacation_mode,
 )
 
 
@@ -113,6 +118,9 @@ async def capture_pre_state(
         return {}
     state: dict[str, Any] = {"target_guild_id": guild.id}
     target_member = await _member(guild, user_id) if user_id else None
+
+    if name in {"enable_vacation_mode", "disable_vacation_mode"}:
+        state["vacation_mode_enabled"] = await is_owner_vacation_mode_enabled()
 
     if name in {"timeout_user", "untimeout_user"} and target_member is not None:
         until = getattr(target_member, "timed_out_until", None)
@@ -273,6 +281,14 @@ def derive_inverse(
             "user_id": user_id,
             "muted": bool(pre_state.get("ai_muted")),
         }
+    if (
+        name in {"enable_vacation_mode", "disable_vacation_mode"}
+        and "vacation_mode_enabled" in pre_state
+    ):
+        return "restore_vacation_mode", {
+            **base,
+            "enabled": bool(pre_state["vacation_mode_enabled"]),
+        }
 
     created_id = _result_snowflake(result)
     if name == "create_role" and created_id:
@@ -403,6 +419,14 @@ async def undo_exact_action(
         if operation == "restore_ai_mute":
             await set_ai_muted_user(user_id, guild.id, bool(args.get("muted")))
             return True, "состояние игнорирования восстановлено"
+        if operation == "restore_vacation_mode":
+            enabled = bool(args.get("enabled"))
+            await set_owner_vacation_mode(enabled, actor_id=POS_CREATOR_ID)
+            return True, (
+                "режим отпуска снова включён"
+                if enabled
+                else "режим отпуска снова выключен"
+            )
         if operation == "delete_role":
             role = guild.get_role(int(args.get("role_id") or 0))
             if role is not None:

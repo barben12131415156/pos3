@@ -43,6 +43,7 @@ _CONFLICTING_TOOL_PAIRS = (
     frozenset({"lock_channel", "unlock_channel"}),
     frozenset({"create_invite", "revoke_invite"}),
     frozenset({"deactivate_raid_mode", "set_security_preset"}),
+    frozenset({"enable_vacation_mode", "disable_vacation_mode"}),
 )
 
 
