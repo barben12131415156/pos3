@@ -16,7 +16,7 @@ from config import (
 from guild_config import get_settings as get_guild_settings
 from join_gate import wait_for_join_security
 from logging_utils import send_log_embed, is_log_channel
-from pos_ai import remember_server_message
+from pos_ai import forget_server_messages, remember_server_message
 from storage import add_ai_event, mark_ai_message_deleted, mark_ai_messages_deleted
 
 
@@ -526,11 +526,24 @@ class LoggingCog(commands.Cog):
             await _record_message_edit(before, after)
         except Exception as exc:
             logger.error("Не удалось записать message_edit %s: %s", after.id, exc, exc_info=True)
+        try:
+            await remember_server_message(after)
+        except Exception as exc:
+            logger.error(
+                "Не удалось обновить память P.OS после edit %s: %s",
+                after.id,
+                exc,
+                exc_info=True,
+            )
         await _log_message_edit(before, after)
 
     @commands.Cog.listener()
     async def on_message_delete(self, message: discord.Message):
         if message.guild:
+            try:
+                await forget_server_messages(message.guild.id, {message.id})
+            except Exception as exc:
+                logger.error("Не удалось очистить память для message %s: %s", message.id, exc, exc_info=True)
             try:
                 await mark_ai_message_deleted(message.guild.id, message.id)
             except Exception as exc:
@@ -545,6 +558,10 @@ class LoggingCog(commands.Cog):
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
         if payload.guild_id is None:
             return
+        try:
+            await forget_server_messages(payload.guild_id, {payload.message_id})
+        except Exception as exc:
+            logger.error("Не удалось очистить память для raw message %s: %s", payload.message_id, exc, exc_info=True)
         try:
             await mark_ai_message_deleted(payload.guild_id, payload.message_id)
         except Exception as exc:
@@ -569,6 +586,7 @@ class LoggingCog(commands.Cog):
         if payload.guild_id is None:
             return
         try:
+            await forget_server_messages(payload.guild_id, set(payload.message_ids))
             await mark_ai_messages_deleted(payload.guild_id, payload.message_ids)
             await add_ai_event(
                 guild_id=payload.guild_id,
@@ -589,6 +607,7 @@ class LoggingCog(commands.Cog):
         if not message.guild or is_log_channel(message.channel):
             return
         try:
+            await forget_server_messages(message.guild.id, {item.id for item in messages})
             await mark_ai_messages_deleted(message.guild.id, [item.id for item in messages])
         except Exception as exc:
             logger.error("Не удалось отметить bulk delete в журнале: %s", exc, exc_info=True)

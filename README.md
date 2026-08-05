@@ -132,7 +132,7 @@ the source channel and `/dm` explicitly keeps it private.
 - `PRIMARY_LOG_CHANNEL_ID`, `UPDATE_LOG_CHANNEL_ID`, `LOG_CATEGORY_ID`, `LOG_CATEGORY_NAME`
 - `DB_BACKUP_CHANNEL_ID` — private Discord channel for gzip-compressed, integrity-checked SQLite backups (recommended on Railway)
 - `GOOGLE_SAFEBROWSING_KEY`, `VIRUSTOTAL_KEY` — optional independent URL/file reputation sources
-- `BRAVE_SEARCH_API_KEY` — optional full-web search; without it, `research_web` transparently limits discovery to Wikipedia
+- `BRAVE_SEARCH_API_KEY` — optional independent full-web provider; a configured Gemini route enables Google Search grounding, then Brave/Wikipedia provide fallbacks as available
 - `SECURITY_MONITOR_INTERVAL_SECONDS` — continuous Discord posture scan interval, clamped to 120-3600 seconds (default: 900)
 
 See `.env.example` for the full list.

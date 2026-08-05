@@ -999,7 +999,8 @@ POS_AI_TOOLS.extend([
             "description": (
                 "Ищет актуальную информацию в публичном интернете, безопасно читает "
                 "несколько источников и возвращает ответ только с фактическими ссылками. "
-                "При отсутствии Brave Search использует ограниченный Wikipedia fallback. "
+                "Использует Google Search grounding, Brave Search и независимый "
+                "Wikipedia fallback в зависимости от доступности провайдеров. "
                 "ТОЛЬКО для владельца."
             ),
             "parameters": {
@@ -1010,8 +1011,10 @@ POS_AI_TOOLS.extend([
                         "description": "Что именно найти или проверить в интернете.",
                     },
                     "max_sources": {
-                        "type": "string",
-                        "description": "Необязательно. Число источников от 1 до 4.",
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 6,
+                        "description": "Необязательно. Число источников от 1 до 6.",
                     },
                 },
                 "required": ["query"],

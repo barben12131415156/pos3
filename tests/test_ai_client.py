@@ -6,6 +6,7 @@ import ai_client
 from ai_client import (
     _bounded_float,
     _bounded_int,
+    _extract_gemini_grounded_result,
     _extract_interaction_text,
     _extract_gemini_text,
     _gemini_generate_content_url,
@@ -55,6 +56,44 @@ class _MediaSession:
     def post(self, url, **kwargs):
         self.posts.append((url, kwargs))
         return _MediaResponse(self.payload)
+
+
+class _RawContent:
+    def __init__(self, raw: str):
+        self._raw = raw.encode("utf-8")
+
+    async def read(self, _limit: int) -> bytes:
+        return self._raw
+
+
+class _RawResponse:
+    def __init__(self, status: int, body: str):
+        self.status = status
+        self.headers = {}
+        self.charset = "utf-8"
+        self.content = _RawContent(body)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _SequenceSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.posts = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    def post(self, url, **kwargs):
+        self.posts.append((url, kwargs))
+        return self.responses.pop(0)
 
 
 class ExtractJsonBlockTests(unittest.TestCase):
@@ -241,6 +280,123 @@ class AIClientBoundaryTests(unittest.TestCase):
             "Первая часть.\nВторая часть.",
         )
 
+    def test_grounded_result_uses_only_structured_sources(self):
+        payload = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "text": (
+                                    "Проверенный факт. Второй проверенный факт. "
+                                    "https://invented.example/"
+                                )
+                            }
+                        ]
+                    },
+                    "groundingMetadata": {
+                        "webSearchQueries": ["проверенный запрос"],
+                        "groundingChunks": [
+                            {
+                                "web": {
+                                    "uri": "https://source.example/article#part",
+                                    "title": "Source",
+                                }
+                            }
+                        ],
+                        "groundingSupports": [
+                            {
+                                "segment": {
+                                    "startIndex": 0,
+                                    "endIndex": len("Проверенный факт.".encode("utf-8")),
+                                    "text": "Проверенный факт.",
+                                },
+                                "groundingChunkIndices": [0],
+                            },
+                            {
+                                "segment": {
+                                    "startIndex": len("Проверенный факт. ".encode("utf-8")),
+                                    "endIndex": len(
+                                        "Проверенный факт. Второй проверенный факт.".encode(
+                                            "utf-8"
+                                        )
+                                    ),
+                                    "text": "Второй проверенный факт.",
+                                },
+                                "groundingChunkIndices": [0],
+                            },
+                        ],
+                    },
+                }
+            ]
+        }
+
+        result = _extract_gemini_grounded_result(payload, max_sources=4)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result["sources"],
+            [{"title": "Source", "url": "https://source.example/article"}],
+        )
+        self.assertGreaterEqual(result["answer"].count("[1]"), 2)
+        self.assertNotIn("invented.example", result["sources"][0]["url"])
+
+    def test_grounded_result_rejects_answer_without_supports(self):
+        payload = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "Неподтверждённый ответ."}]},
+                    "groundingMetadata": {
+                        "groundingChunks": [
+                            {
+                                "web": {
+                                    "uri": "https://source.example/",
+                                    "title": "Source",
+                                }
+                            }
+                        ],
+                        "groundingSupports": [],
+                    },
+                }
+            ]
+        }
+
+        self.assertIsNone(_extract_gemini_grounded_result(payload, max_sources=4))
+
+    def test_grounding_offsets_are_interpreted_as_utf8_bytes(self):
+        answer = "Русский подтверждённый факт."
+        payload = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": answer}]},
+                    "groundingMetadata": {
+                        "groundingChunks": [
+                            {
+                                "web": {
+                                    "uri": "https://example.com/russian",
+                                    "title": "Source",
+                                }
+                            }
+                        ],
+                        "groundingSupports": [
+                            {
+                                "segment": {
+                                    "startIndex": 0,
+                                    "endIndex": len(answer.encode("utf-8")),
+                                },
+                                "groundingChunkIndices": [0],
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+
+        result = _extract_gemini_grounded_result(payload, max_sources=4)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["answer"], f"{answer} [1]")
+
     def test_interactions_text_parser_reads_model_output_steps(self):
         payload = {
             "status": "completed",
@@ -271,7 +427,187 @@ class AIClientBoundaryTests(unittest.TestCase):
             self.assertTrue(ai_has_configured_media_provider())
 
 
+class ChatProviderRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    def _provider(self, name, provider="generic_openai_compatible"):
+        return {
+            "name": name,
+            "provider": provider,
+            "api_url": "https://api.example.com/v1/chat/completions",
+            "model": "test-model",
+            "api_key": "test-key",
+        }
+
+    async def test_non_json_success_fails_over_to_next_provider(self):
+        providers = [self._provider("broken"), self._provider("healthy")]
+        session = _SequenceSession(
+            [
+                _RawResponse(200, "<html>temporary proxy page</html>"),
+                _RawResponse(
+                    200,
+                    json.dumps(
+                        {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "Ответ резервного провайдера.",
+                                    }
+                                }
+                            ]
+                        }
+                    ),
+                ),
+            ]
+        )
+        with (
+            patch.object(ai_client, "_AI_PROVIDER_POOL", providers),
+            patch.object(
+                ai_client,
+                "_reserve_provider_index",
+                new=AsyncMock(side_effect=[0, 1]),
+            ),
+            patch.object(ai_client.aiohttp, "ClientSession", return_value=session),
+            patch.object(ai_client.aiohttp, "TCPConnector"),
+        ):
+            result = await ai_client.pos_chat_completion(
+                [{"role": "user", "content": "Привет"}]
+            )
+
+        self.assertEqual(result["content"], "Ответ резервного провайдера.")
+        self.assertEqual(len(session.posts), 2)
+
+    async def test_413_retries_once_with_bounded_visual_context(self):
+        provider = self._provider("gemini", provider="gemini")
+        messages = [
+            {"role": "system", "content": "Правила"},
+            *(
+                {"role": "user", "content": f"Старая реплика {index}"}
+                for index in range(40)
+            ),
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Опиши все кадры"},
+                    *(
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/jpeg;base64," + ("A" * 1000)
+                            },
+                        }
+                        for _index in range(8)
+                    ),
+                ],
+            },
+        ]
+        session = _SequenceSession(
+            [
+                _RawResponse(413, "request entity too large"),
+                _RawResponse(
+                    200,
+                    json.dumps(
+                        {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "Кадры проанализированы.",
+                                    }
+                                }
+                            ]
+                        }
+                    ),
+                ),
+            ]
+        )
+        with (
+            patch.object(ai_client, "_AI_PROVIDER_POOL", [provider]),
+            patch.object(
+                ai_client,
+                "_reserve_exact_provider_index",
+                new=AsyncMock(return_value=0),
+            ),
+            patch.object(ai_client.aiohttp, "ClientSession", return_value=session),
+            patch.object(ai_client.aiohttp, "TCPConnector"),
+        ):
+            result = await ai_client.pos_chat_completion(messages)
+
+        self.assertEqual(result["content"], "Кадры проанализированы.")
+        self.assertEqual(len(session.posts), 2)
+        retry_messages = session.posts[1][1]["json"]["messages"]
+        self.assertLess(len(retry_messages), len(messages))
+        retry_visuals = [
+            part
+            for part in retry_messages[-1]["content"]
+            if isinstance(part, dict) and part.get("type") == "image_url"
+        ]
+        self.assertLessEqual(len(retry_visuals), 4)
+
+
 class GeminiMediaRequestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_grounded_search_uses_native_tool_and_header_key(self):
+        provider = {
+            "name": "gemini-search",
+            "provider": "gemini",
+            "api_url": (
+                "https://generativelanguage.googleapis.com/"
+                "v1beta/openai/chat/completions"
+            ),
+            "model": "google/gemini-3.1-flash-lite",
+            "api_key": "search-secret",
+        }
+        session = _MediaSession(
+            {
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "Актуальный факт."}]},
+                        "groundingMetadata": {
+                            "webSearchQueries": ["актуальный факт"],
+                            "groundingChunks": [
+                                {
+                                    "web": {
+                                        "uri": "https://example.com/fact",
+                                        "title": "Example",
+                                    }
+                                }
+                            ],
+                            "groundingSupports": [
+                                {
+                                    "segment": {
+                                        "startIndex": 0,
+                                        "endIndex": len(
+                                            "Актуальный факт.".encode("utf-8")
+                                        ),
+                                        "text": "Актуальный факт.",
+                                    },
+                                    "groundingChunkIndices": [0],
+                                }
+                            ],
+                        },
+                    }
+                ]
+            }
+        )
+
+        with (
+            patch.object(ai_client, "_AI_PROVIDER_POOL", [provider]),
+            patch.object(
+                ai_client,
+                "_reserve_exact_provider_index",
+                new=AsyncMock(return_value=0),
+            ),
+            patch.object(ai_client.aiohttp, "ClientSession", return_value=session),
+            patch.object(ai_client.aiohttp, "TCPConnector"),
+        ):
+            result = await ai_client.pos_gemini_grounded_search("Что произошло?")
+
+        self.assertIsNotNone(result)
+        endpoint, kwargs = session.posts[0]
+        self.assertTrue(endpoint.endswith("gemini-3.1-flash-lite:generateContent"))
+        self.assertNotIn("search-secret", endpoint)
+        self.assertEqual(kwargs["headers"]["x-goog-api-key"], "search-secret")
+        self.assertEqual(kwargs["json"]["tools"], [{"google_search": {}}])
+
     async def test_visual_chat_never_falls_back_to_text_only_provider(self):
         providers = [
             {

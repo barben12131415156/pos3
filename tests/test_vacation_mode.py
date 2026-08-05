@@ -157,18 +157,23 @@ class VacationModePingTests(unittest.IsolatedAsyncioTestCase):
     async def test_cog_handles_vacation_ping_after_moderation_before_ai_chat(self):
         message = _vacation_message(direct_ping=True)
         cog = AIChatCog(SimpleNamespace())
-        with patch(
-            "cogs.ai_chat.wait_for_moderation",
-            new=AsyncMock(return_value=False),
-        ), patch(
-            "cogs.ai_chat.handle_owner_vacation_ping",
-            new=AsyncMock(return_value=True),
-        ) as vacation_handler, patch(
-            "cogs.ai_chat.handle_pos_ai",
-            new=AsyncMock(return_value=True),
-        ) as ai_handler:
+        moderation_gate = AsyncMock(return_value=False)
+        vacation_handler = AsyncMock(return_value=True)
+        ai_handler = AsyncMock(return_value=True)
+        # discord.py unloads/reloads extension modules in an earlier integration
+        # test. Patch the globals bound to this collected class so the test is
+        # independent of the current sys.modules object.
+        with patch.dict(
+            AIChatCog.on_message.__globals__,
+            {
+                "wait_for_moderation": moderation_gate,
+                "handle_owner_vacation_ping": vacation_handler,
+                "handle_pos_ai": ai_handler,
+            },
+        ):
             await cog.on_message(message)
 
+        moderation_gate.assert_awaited_once_with(message.id)
         vacation_handler.assert_awaited_once_with(message)
         ai_handler.assert_not_awaited()
 
