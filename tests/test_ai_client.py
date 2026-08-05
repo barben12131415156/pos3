@@ -73,6 +73,12 @@ class ExtractJsonBlockTests(unittest.TestCase):
             {"results": [{"url": "https://example.com", "label": "allow"}]},
         )
 
+    def test_parses_first_complete_object_when_provider_adds_another_object(self):
+        payload = extract_json_block(
+            'analysis {"decision":"tool"}\nextra {"ignored":true}'
+        )
+        self.assertEqual(payload, {"decision": "tool"})
+
     def test_returns_none_for_invalid_payload(self):
         self.assertIsNone(extract_json_block("not-json-at-all"))
 

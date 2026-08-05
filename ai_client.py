@@ -1141,15 +1141,12 @@ def extract_json_block(text: str) -> dict[str, Any] | None:
     for candidate in candidates:
         if candidate.startswith("json"):
             candidate = candidate[4:].strip()
-        start = candidate.find("{")
-        end = candidate.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            continue
-        blob = candidate[start:end + 1]
-        try:
-            parsed = json.loads(blob)
-        except Exception:
-            continue
-        if isinstance(parsed, dict):
-            return parsed
+        decoder = json.JSONDecoder()
+        for match in re.finditer(r"\{", candidate):
+            try:
+                parsed, _end = decoder.raw_decode(candidate[match.start():])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                return parsed
     return None

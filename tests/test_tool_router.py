@@ -113,6 +113,70 @@ class SemanticToolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan.tool_names, frozenset({"kick_user"}))
         self.assertTrue(plan.is_bound_to(message))
 
+    async def test_router_uses_required_structured_function_call(self):
+        message = _message("P.OS, создай временную роль LIVE")
+        response = {
+            "tool_calls": [
+                {
+                    "id": "router-1",
+                    "type": "function",
+                    "function": {
+                        "name": "route_pos_request",
+                        "arguments": json.dumps(
+                            {
+                                "decision": "tool",
+                                "tool_names": ["create_role"],
+                                "confidence": 0.99,
+                                "explicit_request": True,
+                                "contextual_followup": False,
+                                "reason_code": "direct_request",
+                            }
+                        ),
+                    },
+                }
+            ],
+            "content": "",
+        }
+        completion = AsyncMock(return_value=response)
+        with patch("tool_router.pos_chat_completion", new=completion):
+            plan = await plan_pos_tools(
+                message,
+                request_text=message.content,
+                reference_context="",
+                eligible_tool_names=frozenset({"create_role", "add_role"}),
+                mutating_tool_names=frozenset({"create_role", "add_role"}),
+                tool_schemas=_schemas("create_role", "add_role"),
+            )
+
+        self.assertEqual(plan.tool_names, frozenset({"create_role"}))
+        kwargs = completion.await_args.kwargs
+        self.assertEqual(kwargs["tool_choice"], "required")
+        self.assertEqual(kwargs["provider_type"], "gemini")
+        self.assertEqual(
+            kwargs["tools"][0]["function"]["name"],
+            "route_pos_request",
+        )
+
+    async def test_router_transport_failure_never_becomes_freeform_chat(self):
+        message = _message("P.OS, создай роль LIVE")
+        plan = ToolIntentPlan.no_tools(
+            message,
+            decision="clarify",
+            reason_code="invalid_output",
+            confidence=0.0,
+        )
+        completion = AsyncMock(return_value={"content": "."})
+        with patch("pos_ai.pos_chat_completion", new=completion):
+            result = await request_pos_reply(
+                None,
+                message,
+                [{"role": "user", "content": message.content}],
+                tool_plan=plan,
+            )
+
+        self.assertIn("Никакое серверное действие не выполнялось", result or "")
+        completion.assert_not_awaited()
+
     async def test_contextual_followup_can_restore_user_from_ignore(self):
         message = _message("Да, верни всё как было для него")
         response = {

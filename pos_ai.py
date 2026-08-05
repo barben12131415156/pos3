@@ -5924,6 +5924,11 @@ async def request_pos_reply(
                 "Действие не выполнено: решение управляющего контура не привязано "
                 "к текущему сообщению и автору."
             )
+        if tool_plan.reason_code in {"invalid_output", "unavailable"}:
+            return (
+                "Управляющий AI-контур не вернул проверяемое решение. "
+                "Никакое серверное действие не выполнялось; повтори запрос."
+            )
         allowed_tool_names = (
             tool_plan.tool_names if tool_plan.has_tools else frozenset()
         )

@@ -21,6 +21,7 @@ _MAX_TRUSTED_ACTION_CHARS = 6000
 _MAX_DESCRIPTION_CHARS = 420
 _READ_CONFIDENCE_THRESHOLD = 0.62
 _WRITE_CONFIDENCE_THRESHOLD = 0.74
+_ROUTER_FUNCTION_NAME = "route_pos_request"
 _ROUTER_REASON_CODES = frozenset(
     {
         "direct_request",
@@ -173,6 +174,106 @@ def _build_catalog(
             }
         )
     return catalog
+
+
+def _router_tool_schema(
+    eligible_tool_names: frozenset[str],
+) -> dict[str, Any]:
+    """Force the classifier result through a provider-native function call."""
+    return {
+        "type": "function",
+        "function": {
+            "name": _ROUTER_FUNCTION_NAME,
+            "description": (
+                "Classify the current P.OS request and select only the exact "
+                "capability names required to satisfy it. This function does not "
+                "execute any Discord action."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "decision": {
+                        "type": "string",
+                        "enum": ["chat", "tool", "clarify", "blocked"],
+                    },
+                    "tool_names": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": sorted(eligible_tool_names),
+                        },
+                        "maxItems": _MAX_ROUTED_TOOLS,
+                        "uniqueItems": True,
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                    },
+                    "explicit_request": {"type": "boolean"},
+                    "contextual_followup": {"type": "boolean"},
+                    "reason_code": {
+                        "type": "string",
+                        "enum": sorted(_ROUTER_REASON_CODES - {"invalid_output"}),
+                    },
+                },
+                "required": [
+                    "decision",
+                    "tool_names",
+                    "confidence",
+                    "explicit_request",
+                    "contextual_followup",
+                    "reason_code",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _decode_router_arguments(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return extract_json_block(value)
+    return dict(parsed) if isinstance(parsed, Mapping) else None
+
+
+def _router_payload_from_response(
+    response: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Normalize OpenAI, Gemini and legacy function-call response shapes."""
+    if not response:
+        return None
+    candidates: list[Mapping[str, Any]] = []
+    raw_calls = response.get("tool_calls")
+    if isinstance(raw_calls, list):
+        candidates.extend(item for item in raw_calls if isinstance(item, Mapping))
+    legacy = response.get("function_call")
+    if isinstance(legacy, Mapping):
+        candidates.append({"function": legacy})
+    if response.get("type") == "function_call":
+        candidates.append(response)
+
+    for candidate in candidates:
+        function = candidate.get("function")
+        if isinstance(function, Mapping):
+            name = function.get("name")
+            arguments = function.get("arguments", function.get("args"))
+        else:
+            name = candidate.get("name")
+            arguments = candidate.get("arguments", candidate.get("args"))
+        if str(name or "").strip() != _ROUTER_FUNCTION_NAME:
+            continue
+        payload = _decode_router_arguments(arguments)
+        if payload is not None:
+            return payload
+
+    return extract_json_block(_response_text(response))
 
 
 def _bounded_confidence(value: Any) -> float:
@@ -402,6 +503,7 @@ async def plan_pos_tools(
         catalog,
         trusted_action_context,
     )
+    router_tool = _router_tool_schema(eligible_tool_names)
     last_text = ""
     for attempt in range(2):
         attempt_messages = list(messages)
@@ -417,13 +519,16 @@ async def plan_pos_tools(
             )
         response = await pos_chat_completion(
             attempt_messages,
+            tools=[router_tool],
+            tool_choice="required",
             max_tokens=420,
             temperature=0.0,
             top_p=0.1,
             timeout=POS_AI_TIMEOUT_SECONDS,
+            provider_type="gemini",
         )
         last_text = _response_text(response)
-        parsed = extract_json_block(last_text)
+        parsed = _router_payload_from_response(response)
         if parsed is None:
             continue
         plan = _parse_plan(
