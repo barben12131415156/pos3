@@ -339,6 +339,12 @@ def _parse_plan(
     if any(name not in eligible_tool_names for name in names):
         return None
     selected = frozenset(names)
+    if "undo_recent_actions" in selected:
+        # Journal-based rollback is an exclusive transaction. Allowing a manual
+        # inverse beside it can make the undo claim the action just performed in
+        # the same message instead of the previous user-requested group.
+        names = ["undo_recent_actions"]
+        selected = frozenset(names)
     if any(pair <= selected for pair in _CONFLICTING_TOOL_PAIRS):
         return ToolIntentPlan.no_tools(
             message,

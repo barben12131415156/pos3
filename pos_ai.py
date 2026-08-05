@@ -5932,6 +5932,10 @@ async def request_pos_reply(
         allowed_tool_names = (
             tool_plan.tool_names if tool_plan.has_tools else frozenset()
         )
+        if "undo_recent_actions" in allowed_tool_names:
+            # Defence in depth for hand-built/test plans: rollback never shares
+            # a turn with a manual inverse or any unrelated mutation.
+            allowed_tool_names = frozenset({"undo_recent_actions"})
         require_tool_call = tool_plan.has_tools
     else:
         # No semantic, message-bound plan means no executable capability. This

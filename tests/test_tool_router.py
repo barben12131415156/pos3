@@ -216,6 +216,77 @@ class SemanticToolRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(plan.contextual_followup)
         self.assertEqual(plan.tool_names, frozenset({"unmute_ai_for_user"}))
 
+    async def test_journal_undo_is_exclusive_even_if_model_adds_manual_inverse(self):
+        message = _message("Нет, верни всё обратно")
+        response = {
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "route_pos_request",
+                        "arguments": json.dumps(
+                            {
+                                "decision": "tool",
+                                "tool_names": [
+                                    "unmute_ai_for_user",
+                                    "undo_recent_actions",
+                                ],
+                                "confidence": 0.99,
+                                "explicit_request": False,
+                                "contextual_followup": True,
+                                "reason_code": "contextual_followup",
+                            }
+                        ),
+                    }
+                }
+            ]
+        }
+        names = frozenset({"unmute_ai_for_user", "undo_recent_actions"})
+        with patch("tool_router.pos_chat_completion", new=AsyncMock(return_value=response)):
+            plan = await plan_pos_tools(
+                message,
+                request_text=message.content,
+                reference_context="",
+                eligible_tool_names=names,
+                mutating_tool_names=names,
+                tool_schemas=_schemas(*names),
+                trusted_action_context='[{"operation":"mute_ai_for_user"}]',
+            )
+
+        self.assertEqual(plan.tool_names, frozenset({"undo_recent_actions"}))
+
+    async def test_execution_layer_also_restricts_undo_to_one_schema(self):
+        message = _message("Нет, верни всё обратно")
+        plan = ToolIntentPlan.for_tools(
+            message,
+            {"unmute_ai_for_user", "undo_recent_actions"},
+            contextual_followup=True,
+        )
+        completion = AsyncMock(
+            return_value={
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "undo_recent_actions",
+                            "arguments": "{}",
+                        }
+                    }
+                ]
+            }
+        )
+        with patch("pos_ai.pos_chat_completion", new=completion):
+            await request_pos_reply(
+                None,
+                message,
+                [{"role": "user", "content": message.content}],
+                tool_plan=plan,
+            )
+
+        schemas = completion.await_args.kwargs["tools"]
+        self.assertEqual(
+            [schema["function"]["name"] for schema in schemas],
+            ["undo_recent_actions"],
+        )
+
     async def test_hypothetical_stays_chat(self):
         message = _message("Что произойдёт, если убрать участника с сервера?")
         response = {
